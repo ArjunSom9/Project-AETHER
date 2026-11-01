@@ -1,125 +1,68 @@
-"""
-Project AETHER: Fused Softmax for Collision Sampling
-Optimized for NVIDIA Hopper/Ampere using OpenAI Triton.
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Row-wise fused softmax kept entirely in SRAM (Triton 2.0).
 
-In standard DSMC algorithms, evaluating the Maxwell-Boltzmann distribution 
-or calculating collision pair probabilities requires multiple passes over the data 
-(max, subtract, exp, sum, divide). In a legacy code, this generates 5 roundtrips 
-to High Bandwidth Memory (HBM), creating a massive "memory wall".
+An unfused softmax makes separate passes for the row maximum, the
+subtraction and exponential, the sum, and the division, each one a round trip
+to HBM. This kernel loads each row once, computes the numerically stable
+softmax in registers, and stores it once. The same pattern is the building
+block of FlashAttention-style attention kernels, which keep the softmax
+statistics on chip (report Part IV, 4.2). The GPU path of the relaxed DSMC
+collision (Gumbel-softmax over {collide, pass}) applies it row-wise.
 
-This module implements a Fused Softmax kernel. By keeping the intermediate 
-probability distributions entirely within the GPU's SRAM/Registers, we reduce 
-memory bandwidth requirements by 4x. This is critical when evaluating 
-millions of potential collision pairs simultaneously in the shock layer.
+Typical usage example:
+
+  probs = fused_softmax(logits)  # (rows, cols) float32 CUDA tensor.
 """
 
 import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
-def _fused_softmax_kernel(
-    output_ptr,        # Pointer to the output probabilities
-    input_ptr,         # Pointer to the input logits (e.g., relative velocities/cross-sections)
-    input_row_stride,  # Stride to jump to the next row (particle/cell)
-    output_row_stride, # Stride for output rows
-    n_cols,            # Number of columns (e.g., number of candidate collision partners)
-    BLOCK_SIZE: tl.constexpr # Tile size, must be a power of 2 greater than n_cols
-):
-    """
-    Computes the softmax of a row of input logits directly in SRAM.
-    Designed to be invoked where each thread block handles a single row 
-    (e.g., one particle's probability distribution over local cell candidates).
-    """
-    # The rows of the softmax are independent, so we map each row to a program ID.
-    row_idx = tl.program_id(0)
-    
-    # Calculate the starting memory address for this specific row
-    row_start_ptr = input_ptr + row_idx * input_row_stride
-    
-    # Generate an array of offsets for the elements in the row
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    
-    # Create a mask to prevent reading out of bounds if n_cols < BLOCK_SIZE
-    mask = col_offsets < n_cols
-    
-    # Load the row into SRAM. Out-of-bounds elements are padded with -infinity
-    # so they evaluate to 0 after the exp() operation.
-    row = tl.load(row_start_ptr + col_offsets, mask=mask, other=-float('inf'))
-    
-    # 1. Safe Softmax: Subtract the maximum value in the row to prevent numerical 
-    # overflow (FP16/FP32 precision limits) when computing exp().
-    row_max = tl.max(row, axis=0)
-    safe_row = row - row_max
-    
-    # 2. Exponentiate the safe values
-    numerator = tl.exp(safe_row)
-    
-    # 3. Sum the exponentials along the row to get the normalization denominator
-    denominator = tl.sum(numerator, axis=0)
-    
-    # 4. Divide to get the final probability distribution
-    softmax_output = numerator / denominator
-    
-    # Store the final probabilities back to HBM
-    output_row_start_ptr = output_ptr + row_idx * output_row_stride
-    tl.store(output_row_start_ptr + col_offsets, softmax_output, mask=mask)
+def _softmax_kernel(out_ptr, in_ptr, in_row_stride, out_row_stride, n_cols,
+                    BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask,
+                other=-float('inf'))
+    x = x - tl.max(x, axis=0)
+    numerator = tl.exp(x)
+    y = numerator / tl.sum(numerator, axis=0)
+    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
 
-def apply_fused_softmax(x: torch.Tensor) -> torch.Tensor:
-    """
-    Host wrapper for the Triton Fused Softmax kernel.
-    
+
+def fused_softmax(x: torch.Tensor) -> torch.Tensor:
+    """Softmax over the last dimension of a 2D CUDA tensor.
+
     Args:
-        x: A 2D torch.Tensor of logits [num_particles, num_candidates].
-           For example, collision propensities between a particle and its neighbors.
-           
-    Returns:
-        A 2D torch.Tensor of normalized probabilities.
-    """
-    assert x.is_cuda, "Input tensor must be on the GPU"
-    assert x.dim() == 2, "Input tensor must be 2D [rows, cols]"
-    
-    n_rows, n_cols = x.shape
-    
-    # Allocate the output tensor with the same shape and type
-    y = torch.empty_like(x)
-    
-    # Triton requires the BLOCK_SIZE to be a power of 2. 
-    # We find the smallest power of 2 that is >= n_cols.
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    
-    # Grid limits: 1 thread block per row
-    grid = (n_rows, )
-    
-    # Launch the kernel
-    # We pass the strides of the tensors so the kernel knows how memory is laid out
-    _fused_softmax_kernel[grid](
-        y, 
-        x, 
-        x.stride(0), 
-        y.stride(0), 
-        n_cols, 
-        num_warps=8, # 8 warps (256 threads) is usually optimal for larger rows
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return y
+      x: Logits of shape (rows, cols), float32 on a CUDA device.
 
-# --- Diagnostic / Testing Block ---
-if __name__ == "__main__":
-    # Mock collision logits for 100,000 particles, each considering 128 neighbors
-    n_particles = 100_000
-    n_neighbors = 128
-    
-    # Random logits representing e.g., cross_section * relative_velocity
-    mock_logits = torch.randn(n_particles, n_neighbors, device='cuda')
-    
-    # Calculate probabilities using custom Triton kernel
-    probabilities = apply_fused_softmax(mock_logits)
-    
-    # Verify mathematically (sum of probabilities for each particle should be 1.0)
-    row_sums = probabilities.sum(dim=1)
-    
-    print(f"Computed Softmax for {n_particles} particles.")
-    print(f"Sample Row 0 Sum: {row_sums[0].item():.5f} (Expected: ~1.00000)")
-    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-4), "Softmax output did not normalize to 1"
+    Returns:
+      Probabilities with the same shape and dtype.
+
+    Raises:
+      ValueError: If `x` is not a 2D CUDA tensor.
+    """
+    if not x.is_cuda or x.dim() != 2:
+        raise ValueError('fused_softmax expects a 2D CUDA tensor.')
+    rows, cols = x.shape
+    y = torch.empty_like(x)
+    block = triton.next_power_of_2(cols)
+    num_warps = 4 if block <= 2048 else 8
+    _softmax_kernel[(rows,)](y, x, x.stride(0), y.stride(0), cols,
+                             BLOCK=block, num_warps=num_warps)
+    return y

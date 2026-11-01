@@ -1,0 +1,25 @@
+# Project AETHER: Linux x86_64 + NVIDIA Hopper/Ampere environment.
+#
+# System prerequisites (all released inside the execution window):
+#   * NVIDIA driver >= 535.86 (R535, 2023-07)
+#   * CUDA Toolkit 12.2 Update 1 (12.2.128, 2023-07-31)
+#   * cuDNN 8.9.4 for CUDA 12 (8.9.4.25, 2023-08-09)
+#   * CUTLASS at commit 4575443d44 ("CUTLASS 3.2 (#1024)", 2023-08-08); the
+#     CMake build in src/custom_kernels fetches exactly this commit. The v3.2.0
+#     tag itself was only published on 2023-08-28, after the window closed.
+#
+# jaxlib uses the locally installed CUDA 12.2 / cuDNN 8.9 ("cuda12_local").
+-r requirements.txt
+--find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+jaxlib==0.4.14+cuda12.cudnn89   # 2023-07-27
+
+# PyTorch hosts the Triton kernels. torch 2.0.1 is the newest release available
+# in the window (2.1.0 shipped 2023-10-04) and it pins triton==2.0.0 (2.1.0
+# shipped 2023-09-01). PyTorch bundles its own CUDA 11.8 runtime, which runs on
+# the R535 driver alongside the system CUDA 12.2 used by jaxlib and CUTLASS.
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.0.1+cu118          # 2023-05-08
+triton==2.0.0               # 2023-03-20
+filelock==3.12.2            # 2023-06-12; torch dependency
+sympy==1.12                 # 2023-05-10; torch dependency
+networkx==3.1               # 2023-04-04; torch dependency

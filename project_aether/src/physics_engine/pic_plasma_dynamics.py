@@ -1,182 +1,126 @@
-"""
-Project AETHER: Particle-In-Cell (PIC) Plasma Dynamics Solver
-Optimized for NVIDIA Hopper/Ampere using OpenAI Triton.
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Particle-in-cell push for the re-entry plasma sheath (Triton 2.0).
 
-This module simulates the plasma sheath generated during hypersonic flight, which 
-is responsible for the RF communication "blackout" phenomenon. It models the transport 
-of electrons and ions under self-induced and external electromagnetic fields.
+Electrons and ions in the sheath around a re-entry vehicle move under the
+local electric and magnetic fields. One fused kernel per step
 
-Key Optimization (per Project AETHER architecture):
-The electromagnetic field interpolation (gathering field values from the grid to the 
-particles) is highly bandwidth-bound. We utilize Triton's `@triton.autotune` and 
-explicit cache management (loading 2D tiles of the EM field into shared memory/SRAM) 
-to prevent cache thrashing when particles cross block boundaries.
+  1. gathers E and B at every particle with bilinear weights (shared helpers
+     from `pic_tiled_interpolation`, reusing the corner indices for all six
+     field components),
+  2. advances the velocity with the Boris scheme (J. P. Boris, 1970), which
+     splits the Lorentz force into two electric half-kicks around an exact
+     magnetic rotation and therefore conserves kinetic energy in a pure
+     magnetic field,
+  3. advances the in-plane position.
+
+Fields are node-centered on a row-major (ny, nx) grid; particles should be
+cell-sorted (e.g. by the fused radix sort) so the gathers stay cache local.
+
+Typical usage example:
+
+  boris_push(pos, vel, fields, cell_size=(dx, dy), charge_mass=-1.76e11,
+             dt=1e-12)
 """
+
+from collections.abc import Sequence
 
 import torch
 import triton
 import triton.language as tl
 
-# ==============================================================================
-# Triton Kernel: EM Field Gather & Lorentz Push
-# ==============================================================================
+from src.custom_kernels.triton import pic_tiled_interpolation as interp
 
-# Autotuning to find the optimal tile sizes for different GPU architectures
-# (e.g., A100 vs H100) to ensure portability and peak memory bandwidth utilization.
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_PARTICLES': 1024, 'TILE_X': 64, 'TILE_Y': 64}, num_warps=8),
-        triton.Config({'BLOCK_PARTICLES': 2048, 'TILE_X': 128, 'TILE_Y': 128}, num_warps=8),
-        triton.Config({'BLOCK_PARTICLES': 512, 'TILE_X': 32, 'TILE_Y': 256}, num_warps=4),
-        triton.Config({'BLOCK_PARTICLES': 1024, 'TILE_X': 128, 'TILE_Y': 64}, num_warps=4),
-    ],
-    key=['num_particles', 'grid_size_x', 'grid_size_y'],
-)
+
 @triton.jit
-def pic_em_gather_and_push_kernel(
-    # Particle arrays (Structure of Arrays for coalesced access)
-    pos_x_ptr, pos_y_ptr,
-    vel_x_ptr, vel_y_ptr, vel_z_ptr,
-    out_vel_x_ptr, out_vel_y_ptr, out_vel_z_ptr,
-    # Electromagnetic Grid arrays (flattened 2D grid)
-    E_x_ptr, E_y_ptr, E_z_ptr,
-    B_x_ptr, B_y_ptr, B_z_ptr,
-    # Grid metadata
-    grid_size_x: tl.int32, 
-    grid_size_y: tl.int32,
-    dx: tl.float32, 
-    dy: tl.float32,
-    # Physical constants
-    charge_mass_ratio: tl.float32, # q/m
-    dt: tl.float32,
-    num_particles: tl.int32,
-    # Autotuned hyperparameters
-    BLOCK_PARTICLES: tl.constexpr,
-    TILE_X: tl.constexpr, 
-    TILE_Y: tl.constexpr
+def _boris_kernel(
+    x_ptr, y_ptr, vx_ptr, vy_ptr, vz_ptr,
+    ex_ptr, ey_ptr, ez_ptr, bx_ptr, by_ptr, bz_ptr,
+    n, nx, ny, inv_dx, inv_dy, half_qm_dt, dt,
+    BLOCK: tl.constexpr,
 ):
-    """
-    Triton kernel that performs the PIC gather (interpolation) and Lorentz push.
-    
-    To avoid HBM latency, this kernel is designed to process particles sorted 
-    by their spatial tiles. It explicitly loads a tile of the EM grid into SRAM, 
-    then all particles in that block read from the fast SRAM cache.
-    """
-    pid = tl.program_id(axis=0)
-    
-    # 1. Setup particle offsets for this thread block
-    particle_start = pid * BLOCK_PARTICLES
-    p_offsets = particle_start + tl.arange(0, BLOCK_PARTICLES)
-    p_mask = p_offsets < num_particles
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offs, mask=mask, other=0.0)
+    base, w00, w10, w01, w11 = interp.bilinear_weights(x, y, inv_dx, inv_dy,
+                                                       nx, ny)
+    ex = interp.bilinear_gather(ex_ptr, base, w00, w10, w01, w11, nx, mask)
+    ey = interp.bilinear_gather(ey_ptr, base, w00, w10, w01, w11, nx, mask)
+    ez = interp.bilinear_gather(ez_ptr, base, w00, w10, w01, w11, nx, mask)
+    bx = interp.bilinear_gather(bx_ptr, base, w00, w10, w01, w11, nx, mask)
+    by = interp.bilinear_gather(by_ptr, base, w00, w10, w01, w11, nx, mask)
+    bz = interp.bilinear_gather(bz_ptr, base, w00, w10, w01, w11, nx, mask)
 
-    # 2. Load particle positions from HBM
-    x = tl.load(pos_x_ptr + p_offsets, mask=p_mask)
-    y = tl.load(pos_y_ptr + p_offsets, mask=p_mask)
-    
-    # 3. Calculate grid indices for nearest-neighbor or bilinear interpolation
-    # For performance in this demo, we use nearest-neighbor grid indexing
-    grid_i = tl.cast(x / dx, tl.int32)
-    grid_j = tl.cast(y / dy, tl.int32)
-    
-    # Clamp to grid boundaries to prevent out-of-bounds access
-    grid_i = tl.where(grid_i < 0, 0, tl.where(grid_i >= grid_size_x, grid_size_x - 1, grid_i))
-    grid_j = tl.where(grid_j < 0, 0, tl.where(grid_j >= grid_size_y, grid_size_y - 1, grid_j))
-    
-    # Calculate flattened 1D index for the 2D grid
-    grid_idx = grid_i * grid_size_y + grid_j
-    
-    # 4. Gather Electromagnetic Fields
-    # In a fully optimized scenario, if particles are pre-sorted by (grid_i, grid_j),
-    # we would load a TILE_X x TILE_Y block of the EM field into shared memory once.
-    # Here, we utilize standard gathered loads which Triton will attempt to coalesce
-    # via the L2 cache if particles are physically localized.
-    Ex = tl.load(E_x_ptr + grid_idx, mask=p_mask)
-    Ey = tl.load(E_y_ptr + grid_idx, mask=p_mask)
-    Ez = tl.load(E_z_ptr + grid_idx, mask=p_mask)
-    
-    Bx = tl.load(B_x_ptr + grid_idx, mask=p_mask)
-    By = tl.load(B_y_ptr + grid_idx, mask=p_mask)
-    Bz = tl.load(B_z_ptr + grid_idx, mask=p_mask)
+    # Boris: half electric kick, magnetic rotation, half electric kick.
+    vx = tl.load(vx_ptr + offs, mask=mask, other=0.0) + half_qm_dt * ex
+    vy = tl.load(vy_ptr + offs, mask=mask, other=0.0) + half_qm_dt * ey
+    vz = tl.load(vz_ptr + offs, mask=mask, other=0.0) + half_qm_dt * ez
+    tx, ty, tz = half_qm_dt * bx, half_qm_dt * by, half_qm_dt * bz
+    s_factor = 2.0 / (1.0 + tx * tx + ty * ty + tz * tz)
+    px = vx + (vy * tz - vz * ty)
+    py = vy + (vz * tx - vx * tz)
+    pz = vz + (vx * ty - vy * tx)
+    vx = vx + s_factor * (py * tz - pz * ty) + half_qm_dt * ex
+    vy = vy + s_factor * (pz * tx - px * tz) + half_qm_dt * ey
+    vz = vz + s_factor * (px * ty - py * tx) + half_qm_dt * ez
 
-    # 5. Load particle velocities
-    vx = tl.load(vel_x_ptr + p_offsets, mask=p_mask)
-    vy = tl.load(vel_y_ptr + p_offsets, mask=p_mask)
-    vz = tl.load(vel_z_ptr + p_offsets, mask=p_mask)
-
-    # 6. Compute Lorentz Force: F = q(E + v x B) => dv/dt = (q/m)(E + v x B)
-    # Cross product: v x B
-    cross_x = vy * Bz - vz * By
-    cross_y = vz * Bx - vx * Bz
-    cross_z = vx * By - vy * Bx
-    
-    # Velocity update (Euler integration for simplicity; Boris push used in prod)
-    new_vx = vx + charge_mass_ratio * (Ex + cross_x) * dt
-    new_vy = vy + charge_mass_ratio * (Ey + cross_y) * dt
-    new_vz = vz + charge_mass_ratio * (Ez + cross_z) * dt
-
-    # 7. Store updated velocities back to HBM
-    tl.store(out_vel_x_ptr + p_offsets, new_vx, mask=p_mask)
-    tl.store(out_vel_y_ptr + p_offsets, new_vy, mask=p_mask)
-    tl.store(out_vel_z_ptr + p_offsets, new_vz, mask=p_mask)
+    tl.store(vx_ptr + offs, vx, mask=mask)
+    tl.store(vy_ptr + offs, vy, mask=mask)
+    tl.store(vz_ptr + offs, vz, mask=mask)
+    tl.store(x_ptr + offs, x + vx * dt, mask=mask)
+    tl.store(y_ptr + offs, y + vy * dt, mask=mask)
 
 
-# ==============================================================================
-# Host Interface
-# ==============================================================================
+def boris_push(positions: Sequence[torch.Tensor],
+               velocities: Sequence[torch.Tensor],
+               fields: Sequence[torch.Tensor], cell_size: Sequence[float],
+               charge_mass: float, dt: float) -> None:
+    """Advances charged particles one step in place.
 
-def simulate_plasma_sheath_step(
-    positions: dict,
-    velocities: dict,
-    em_grid: dict,
-    grid_dims: tuple,
-    cell_size: tuple,
-    dt: float,
-    charge_mass_ratio: float
-) -> dict:
-    """
-    Host wrapper for the PIC Lorentz push kernel.
-    Updates the velocities of plasma particles (electrons/ions) under the influence 
-    of the electromagnetic field grid.
-    
     Args:
-        positions: dict of tensors {'x': ..., 'y': ...}
-        velocities: dict of tensors {'u': ..., 'v': ..., 'w': ...}
-        em_grid: dict of flattened grid tensors {'Ex': ..., 'Ey': ..., 'Ez': ..., 'Bx': ..., ...}
-        grid_dims: (size_x, size_y)
-        cell_size: (dx, dy)
-        dt: Time step.
-        charge_mass_ratio: Physical q/m ratio (-e/m_e for electrons, +e/m_i for ions).
-        
-    Returns:
-        updated_velocities: dict of updated velocity tensors.
+      positions: (x, y) float32 CUDA tensors (N,), updated in place.
+      velocities: (vx, vy, vz) float32 CUDA tensors (N,), updated in place.
+      fields: (Ex, Ey, Ez, Bx, By, Bz), contiguous float32 CUDA tensors of
+        shape (ny, nx) each.
+      cell_size: Grid spacing (dx, dy).
+      charge_mass: Charge-to-mass ratio q/m [C/kg].
+      dt: Time step [s].
     """
-    num_particles = positions['x'].shape[0]
-    grid_size_x, grid_size_y = grid_dims
-    dx, dy = cell_size
-    
-    # Allocate output velocity tensors
-    out_vel = {
-        'u': torch.empty_like(velocities['u']),
-        'v': torch.empty_like(velocities['v']),
-        'w': torch.empty_like(velocities['w'])
-    }
-    
-    # Launch configuration using a generic lambda. The @triton.autotune decorator 
-    # will dynamically overwrite BLOCK_PARTICLES to find the optimal grid size.
-    def grid(meta):
-        return (triton.cdiv(num_particles, meta['BLOCK_PARTICLES']), )
+    ny, nx = fields[0].shape
+    n = positions[0].numel()
+    block = 1024
+    _boris_kernel[(triton.cdiv(n, block),)](
+        *positions, *velocities, *(f.contiguous() for f in fields), n, nx, ny,
+        1.0 / cell_size[0], 1.0 / cell_size[1], 0.5 * charge_mass * dt, dt,
+        BLOCK=block, num_warps=4)
 
-    # Execute Kernel
-    pic_em_gather_and_push_kernel[grid](
-        positions['x'], positions['y'],
-        velocities['u'], velocities['v'], velocities['w'],
-        out_vel['u'], out_vel['v'], out_vel['w'],
-        em_grid['Ex'], em_grid['Ey'], em_grid['Ez'],
-        em_grid['Bx'], em_grid['By'], em_grid['Bz'],
-        grid_size_x, grid_size_y,
-        dx, dy,
-        charge_mass_ratio, dt,
-        num_particles
-    )
-    
-    return out_vel
+
+def reference_boris_push(positions: Sequence[torch.Tensor],
+                         velocities: Sequence[torch.Tensor],
+                         fields: Sequence[torch.Tensor],
+                         cell_size: Sequence[float], charge_mass: float,
+                         dt: float
+                         ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Out-of-place PyTorch reference of `boris_push` (also runs on CPU)."""
+    x, y = positions
+    e = [interp.reference_interpolate(f, x, y, cell_size) for f in fields[:3]]
+    b = [interp.reference_interpolate(f, x, y, cell_size) for f in fields[3:]]
+    h = 0.5 * charge_mass * dt
+    v = torch.stack(list(velocities)) + h * torch.stack(e)
+    t = h * torch.stack(b)
+    s = 2.0 * t / (1.0 + (t * t).sum(0))
+    v_prime = v + torch.cross(v, t, dim=0)
+    v = v + torch.cross(v_prime, s, dim=0) + h * torch.stack(e)
+    return [x + v[0] * dt, y + v[1] * dt], [v[0], v[1], v[2]]

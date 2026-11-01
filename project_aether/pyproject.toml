@@ -1,0 +1,44 @@
+[project]
+name = "project-aether"
+version = "0.1.0"
+description = "GPU systems engineering for thermochemical hypersonic environment reconstruction (June-August 2023)."
+requires-python = ">=3.11,<3.12"
+license = {text = "Apache-2.0"}
+
+[tool.pytest.ini_options]
+# Lets `pytest` resolve the full package paths (`src.physics_engine...`)
+# without installing the project.
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.pylint.main]
+py-version = "3.11"
+jobs = 0
+
+[tool.pylint.format]
+# Google Python Style Guide section 3.2 / 3.4.
+max-line-length = 80
+indent-string = "    "
+
+[tool.pylint.basic]
+# Single-letter and short mathematical names are allowed where they follow the
+# notation of the cited paper (style guide section 3.16.5).
+good-names = ["i", "j", "k", "n", "x", "y", "z", "t", "q", "_", "dx", "dy",
+              "dt", "mu", "tl"]
+# As in Google's pylintrc: tests, main, and private helpers need no docstring,
+# nor do functions shorter than 12 lines (style guide section 3.8.3).
+no-docstring-rgx = "(__.*__|main|test.*|Test.*|.*test|.*Test|_.*)$"
+docstring-min-length = 12
+
+[tool.pylint."messages control"]
+disable = [
+    # Disabled in Google's pylintrc.
+    "too-many-arguments",
+    "too-many-locals",
+    "too-many-statements",
+    "too-many-branches",
+    "too-many-instance-attributes",
+    "too-few-public-methods",
+    # Notation-following names (Q, F, G, ...) are documented per module.
+    "invalid-name",
+]

@@ -1,213 +1,120 @@
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Physics-informed training loss for the flow-field surrogate.
+
+Report Part IV, 4.1: training minimizes data error plus a PDE-residual penalty
+in the style of physics-informed neural networks (M. Raissi, P. Perdikaris,
+G. E. Karniadakis, J. Comput. Phys. 378, 2019):
+
+    L = L_data + lambda * L_pde.
+
+The surrogate predicts whole fields on the solver grid, so the residual is
+evaluated with the same differentiable finite-volume operator that generated
+the training data (`cfd_navier_stokes.evaluate_rhs`). For a predicted step
+Q^n -> Q^{n+1} the compressible Navier-Stokes residual is the trapezoidal
+(Crank-Nicolson) balance
+
+    R = (Q^{n+1} - Q^n) / dt - 1/2 [RHS(Q^n) + RHS(Q^{n+1})],
+
+which vanishes for any state the conservation laws allow. Gradients of
+L_pde flow through the solver operator into the surrogate parameters.
+
+Both terms are measured in normalized units (per-channel standard deviation),
+because density and total energy differ by orders of magnitude.
+
+Typical usage example:
+
+  loss, aux = physics_informed_loss.loss_fn(q_pred, q_true, q_prev, scale,
+                                            flow, physics_weight=1e-2)
 """
-Project AETHER: Physics-Informed Loss for Surrogate Models
-Ensures Transformer predictions strictly conserve physical quantities.
 
-Standard LLM/Transformer training relies purely on data (MSE/Cross-Entropy).
-For hypersonic aerothermodynamics, the model must obey the Navier-Stokes 
-equations to prevent "hallucinations" in unseen flight regimes. 
+from typing import NamedTuple
 
-This module computes the total loss: L_total = L_data + lambda * ||N(u_pred)||^2
-where N represents the non-linear differential operators (PDE residuals).
-"""
+import jax
+import jax.numpy as jnp
 
-import torch
-import torch.nn as nn
+from src.physics_engine import cfd_navier_stokes
 
-def compute_gradient(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+
+class FlowSetup(NamedTuple):
+    """Discretization the surrogate was trained on (hashable, static).
+
+    Attributes:
+      dt: Time step between the input and the predicted field [s].
+      dx: Cell width [m].
+      dy: Cell height [m].
+      mu: Dynamic viscosity [Pa s].
+      bc: Boundary conditions.
     """
-    Computes the gradient of a tensor y with respect to a tensor x using 
-    PyTorch's automatic differentiation. 
-    `create_graph=True` allows for higher-order derivatives (e.g., Laplacians)
-    and backpropagation through the derivative calculation itself.
+    dt: float
+    dx: float
+    dy: float
+    mu: float
+    bc: cfd_navier_stokes.BoundaryConditions = (
+        cfd_navier_stokes.BoundaryConditions())
+
+
+def navier_stokes_residual(q_prev: jax.Array, q_next: jax.Array,
+                           flow: FlowSetup) -> jax.Array:
+    """Crank-Nicolson residual of one step, shape (batch, 4, ny, nx).
+
+    Args:
+      q_prev: Conserved fields at step n, shape (batch, 4, ny, nx).
+      q_next: Conserved fields at step n + 1, same shape.
+      flow: Discretization.
+
+    Returns:
+      The residual R = (q_next - q_prev) / dt - (RHS(q_prev) + RHS(q_next))/2.
     """
-    grad = torch.autograd.grad(
-        outputs=y,
-        inputs=x,
-        grad_outputs=torch.ones_like(y),
-        create_graph=True,
-        retain_graph=True,
-        allow_unused=True
-    )[0]
-    return grad
+    rhs = jax.vmap(lambda q: cfd_navier_stokes.evaluate_rhs(
+        q, flow.dx, flow.dy, flow.mu, flow.bc))
+    return (q_next - q_prev) / flow.dt - 0.5 * (rhs(q_prev) + rhs(q_next))
 
-class NavierStokesResidual(nn.Module):
+
+def loss_fn(q_pred: jax.Array, q_true: jax.Array, q_prev: jax.Array,
+            scale: jax.Array, flow: FlowSetup,
+            physics_weight: float | jax.Array
+            ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Total physics-informed loss and its components.
+
+    Args:
+      q_pred: Predicted fields at step n + 1, shape (batch, 4, ny, nx).
+      q_true: Reference fields at step n + 1, same shape.
+      q_prev: Input fields at step n, same shape.
+      scale: Per-channel normalization scale, shape (4,).
+      flow: Discretization used for the PDE residual.
+      physics_weight: lambda in L = L_data + lambda * L_pde.
+
+    Returns:
+      A tuple (total, {'data': L_data, 'pde': L_pde}).
     """
-    Calculates the PDE residuals for compressible 2D Navier-Stokes/Euler equations.
-    If the network perfectly learns the physics, these residuals will be exactly zero.
+    s = scale[None, :, None, None]
+    data = jnp.mean(((q_pred - q_true) / s)**2)
+    residual = navier_stokes_residual(q_prev, q_pred, flow)
+    pde = jnp.mean((residual * flow.dt / s)**2)
+    total = data + physics_weight * pde
+    return total, {'data': data, 'pde': pde}
+
+
+def annealed_physics_weight(step: int | jax.Array, total_steps: int,
+                            start: float = 1e-4,
+                            end: float = 1e-1) -> jax.Array:
+    """Geometric ramp of lambda from `start` to `end` over training.
+
+    The data term dominates early; physical consistency is then enforced
+    progressively, which avoids collapsing to trivial residual minimizers.
     """
-    def __init__(self, gamma: float = 1.4):
-        super().__init__()
-        self.gamma = gamma
-
-    def forward(self, 
-                rho: torch.Tensor, 
-                u: torch.Tensor, 
-                v: torch.Tensor, 
-                p: torch.Tensor, 
-                t: torch.Tensor, 
-                x: torch.Tensor, 
-                y: torch.Tensor,
-                mu: float = 0.0) -> torch.Tensor:
-        """
-        Args:
-            rho, u, v, p: Predicted density, x-velocity, y-velocity, and pressure.
-                          Must be connected to the autograd graph.
-            t, x, y: Spatiotemporal coordinates. Must have `requires_grad=True`.
-            mu: Dynamic viscosity (0.0 implies inviscid Euler equations).
-            
-        Returns:
-            Total physics residual (sum of squared errors across all conservation laws).
-        """
-        # ---------------------------------------------------------------------
-        # 1. Conservation of Mass (Continuity Equation)
-        # d(rho)/dt + d(rho*u)/dx + d(rho*v)/dy = 0
-        # ---------------------------------------------------------------------
-        rho_t = compute_gradient(rho, t)
-        
-        rho_u = rho * u
-        rho_u_x = compute_gradient(rho_u, x)
-        
-        rho_v = rho * v
-        rho_v_y = compute_gradient(rho_v, y)
-        
-        continuity_residual = rho_t + rho_u_x + rho_v_y
-
-        # ---------------------------------------------------------------------
-        # 2. Conservation of X-Momentum
-        # d(rho*u)/dt + d(rho*u^2 + p)/dx + d(rho*u*v)/dy - Viscous Terms = 0
-        # ---------------------------------------------------------------------
-        rho_u_t = compute_gradient(rho_u, t)
-        
-        momentum_xx = rho * u**2 + p
-        momentum_xx_x = compute_gradient(momentum_xx, x)
-        
-        momentum_xy = rho * u * v
-        momentum_xy_y = compute_gradient(momentum_xy, y)
-        
-        # Add viscous terms if mu > 0 (requires 2nd derivatives)
-        viscous_x = 0.0
-        if mu > 0:
-            u_x = compute_gradient(u, x)
-            u_xx = compute_gradient(u_x, x)
-            u_y = compute_gradient(u, y)
-            u_yy = compute_gradient(u_y, y)
-            viscous_x = mu * (u_xx + u_yy)
-            
-        x_momentum_residual = rho_u_t + momentum_xx_x + momentum_xy_y - viscous_x
-
-        # ---------------------------------------------------------------------
-        # 3. Conservation of Y-Momentum
-        # d(rho*v)/dt + d(rho*u*v)/dx + d(rho*v^2 + p)/dy - Viscous Terms = 0
-        # ---------------------------------------------------------------------
-        rho_v_t = compute_gradient(rho_v, t)
-        
-        momentum_yx = rho * u * v
-        momentum_yx_x = compute_gradient(momentum_yx, x)
-        
-        momentum_yy = rho * v**2 + p
-        momentum_yy_y = compute_gradient(momentum_yy, y)
-        
-        viscous_y = 0.0
-        if mu > 0:
-            v_x = compute_gradient(v, x)
-            v_xx = compute_gradient(v_x, x)
-            v_y = compute_gradient(v, y)
-            v_yy = compute_gradient(v_y, y)
-            viscous_y = mu * (v_xx + v_yy)
-            
-        y_momentum_residual = rho_v_t + momentum_yx_x + momentum_yy_y - viscous_y
-
-        # ---------------------------------------------------------------------
-        # Total Physics Loss (Mean Squared Error of all residuals)
-        # ---------------------------------------------------------------------
-        physics_loss = (
-            torch.mean(continuity_residual**2) + 
-            torch.mean(x_momentum_residual**2) + 
-            torch.mean(y_momentum_residual**2)
-        )
-        
-        return physics_loss
-
-class PhysicsInformedLoss(nn.Module):
-    """
-    The unified loss function for the Project AETHER Surrogate Model.
-    Balances empirical data matching (MSE) with PDE constraint satisfaction.
-    """
-    def __init__(self, physics_weight: float = 1e-3, gamma: float = 1.4):
-        super().__init__()
-        self.data_loss_fn = nn.MSELoss()
-        self.physics_residual_fn = NavierStokesResidual(gamma=gamma)
-        
-        # Lambda: Weight controlling how strictly the network must obey physics.
-        # Often annealed during training (starts low, increases as network converges on data).
-        self.physics_weight = physics_weight
-
-    def forward(self, 
-                predictions: torch.Tensor, 
-                targets: torch.Tensor, 
-                coords: torch.Tensor, 
-                mu: float = 0.0) -> tuple:
-        """
-        Args:
-            predictions: [Batch, Sequence, Features] Output from the PIT.
-                         Features assumed to be: [rho, u, v, p]
-            targets: [Batch, Sequence, Features] Ground truth CFD/DSMC data.
-            coords: [Batch, Sequence, 3] Spatiotemporal coordinates [t, x, y].
-                    Must have requires_grad=True.
-            mu: Fluid viscosity.
-            
-        Returns:
-            Tuple of (Total Loss, Data Loss, Physics Loss)
-        """
-        # 1. Compute standard Data Loss (MSE against ground truth)
-        data_loss = self.data_loss_fn(predictions, targets)
-        
-        # 2. Extract specific variables for Autograd
-        # We must split the tensors individually to track separate gradients
-        t = coords[..., 0:1]
-        x = coords[..., 1:2]
-        y = coords[..., 2:3]
-        
-        rho = predictions[..., 0:1]
-        u   = predictions[..., 1:2]
-        v   = predictions[..., 2:3]
-        p   = predictions[..., 3:4]
-        
-        # 3. Compute Physics Residual Loss
-        physics_loss = self.physics_residual_fn(rho, u, v, p, t, x, y, mu)
-        
-        # 4. Total Combined Loss
-        total_loss = data_loss + (self.physics_weight * physics_loss)
-        
-        return total_loss, data_loss, physics_loss
-
-# --- Diagnostic / Testing Block ---
-if __name__ == "__main__":
-    # Mock parameters
-    batch_size = 32
-    seq_len = 100 # Representing points in the spatial mesh over time
-    
-    # Coordinates MUST have requires_grad=True to compute PDE residuals
-    coords = torch.rand(batch_size, seq_len, 3, requires_grad=True)
-    
-    # Mock Model predictions [rho, u, v, p]
-    # In reality, this comes from the Transformer Engine output
-    preds = torch.rand(batch_size, seq_len, 4, requires_grad=True) 
-    
-    # Mock Ground Truth from JAX CFD solver
-    targets = torch.rand(batch_size, seq_len, 4)
-    
-    print("Evaluating Physics-Informed Loss Module...")
-    
-    loss_module = PhysicsInformedLoss(physics_weight=0.1)
-    
-    total_loss, data_loss, phys_loss = loss_module(preds, targets, coords)
-    
-    print(f"Data Loss (MSE):       {data_loss.item():.6f}")
-    print(f"Physics Loss (PDEs):   {phys_loss.item():.6f}")
-    print(f"Total Combined Loss:   {total_loss.item():.6f}")
-    
-    # Verify backpropagation works
-    print("Testing backward pass through Autograd graph...")
-    total_loss.backward()
-    print("Backward pass successful. Gradients successfully routed through PDE residual operators.")
+    frac = jnp.clip(jnp.asarray(step, jnp.float32) / max(total_steps, 1),
+                    0.0, 1.0)
+    return start * (end / start)**frac
