@@ -1,134 +1,108 @@
-"""
-Project AETHER: Fused Particle Push and Boundary Check Kernel
-Optimized for NVIDIA H100 (Hopper) architectures.
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Fused particle push with specular wall reflection (Triton 2.0).
 
-This module implements a custom OpenAI Triton kernel for the PIC/DSMC "Move" phase.
-It utilizes a Structure-of-Arrays (SoA) layout to maximize cache line utilization
-and fuses the kinematic update with spatial boundary checks to bypass HBM roundtrips.
+The DSMC/PIC "move" stage advances x += v dt and reflects particles at the
+domain walls. Fusing the kinematic update and the six wall tests into one
+kernel reads each Structure-of-Arrays component once and writes it once,
+instead of one HBM round trip per elementwise operation. With the SoA layout,
+every load and store is fully coalesced.
+
+Typical usage example:
+
+  fused_particle_push(pos, vel, dt=1e-7, lo=(0., 0., 0.), hi=(1., 1., 1.))
 """
+
+from collections.abc import Sequence
 
 import torch
 import triton
 import triton.language as tl
 
+_BLOCK = 1024
+
+
 @triton.jit
-def _fused_push_boundary_kernel(
-    # Pointers to Structure-of-Arrays (SoA) layout for Positions
-    pos_x_ptr, pos_y_ptr, pos_z_ptr,
-    # Pointers to Structure-of-Arrays (SoA) layout for Velocities
-    vel_x_ptr, vel_y_ptr, vel_z_ptr,
-    # Pointers to output SoA (can be same as input for in-place updates)
-    out_pos_x_ptr, out_pos_y_ptr, out_pos_z_ptr,
-    out_vel_x_ptr, out_vel_y_ptr, out_vel_z_ptr,
-    # Simulation Parameters
-    dt: tl.float32,
-    domain_max_x: tl.float32, domain_max_y: tl.float32, domain_max_z: tl.float32,
-    domain_min_x: tl.float32, domain_min_y: tl.float32, domain_min_z: tl.float32,
-    num_particles: tl.int32,
-    # Meta-parameters
-    BLOCK_SIZE: tl.constexpr
+def _reflect(c, v, lo, hi):
+    """Specular reflection of coordinate c (velocity v) into [lo, hi]."""
+    below = c < lo
+    above = c > hi
+    c = tl.where(below, 2.0 * lo - c, c)
+    c = tl.where(above, 2.0 * hi - c, c)
+    v = tl.where(below | above, -v, v)
+    return c, v
+
+
+@triton.jit
+def _push_kernel(
+    x_ptr, y_ptr, z_ptr, vx_ptr, vy_ptr, vz_ptr,
+    n, dt,
+    x_lo, y_lo, z_lo, x_hi, y_hi, z_hi,
+    BLOCK: tl.constexpr,
 ):
-    """
-    Triton kernel that loads SoA particle data, advances positions by v*dt,
-    evaluates domain wall collisions (specular reflection), and stores the result.
-    Fusing these steps keeps the intermediate out-of-bounds state entirely in SRAM.
-    """
-    # 1. Map thread block to particle indices
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    
-    # Mask to prevent out-of-bounds memory access for the last block
-    mask = offsets < num_particles
-
-    # 2. Coalesced Load from Global Memory (HBM) -> SRAM
-    # Using SoA guarantees contiguous memory access across the warp
-    x = tl.load(pos_x_ptr + offsets, mask=mask)
-    y = tl.load(pos_y_ptr + offsets, mask=mask)
-    z = tl.load(pos_z_ptr + offsets, mask=mask)
-    
-    vx = tl.load(vel_x_ptr + offsets, mask=mask)
-    vy = tl.load(vel_y_ptr + offsets, mask=mask)
-    vz = tl.load(vel_z_ptr + offsets, mask=mask)
-
-    # 3. Kinematic Push (Compute in SRAM)
-    next_x = x + vx * dt
-    next_y = y + vy * dt
-    next_z = z + vz * dt
-
-    # 4. Fused Boundary Checks (Specular Reflection)
-    # X-Axis boundaries
-    hit_x_min = next_x < domain_min_x
-    hit_x_max = next_x > domain_max_x
-    next_vx = tl.where(hit_x_min | hit_x_max, -vx, vx) # Reverse velocity
-    next_x = tl.where(hit_x_min, domain_min_x + (domain_min_x - next_x), next_x) # Bounce logic
-    next_x = tl.where(hit_x_max, domain_max_x - (next_x - domain_max_x), next_x)
-
-    # Y-Axis boundaries
-    hit_y_min = next_y < domain_min_y
-    hit_y_max = next_y > domain_max_y
-    next_vy = tl.where(hit_y_min | hit_y_max, -vy, vy)
-    next_y = tl.where(hit_y_min, domain_min_y + (domain_min_y - next_y), next_y)
-    next_y = tl.where(hit_y_max, domain_max_y - (next_y - domain_max_y), next_y)
-
-    # Z-Axis boundaries
-    hit_z_min = next_z < domain_min_z
-    hit_z_max = next_z > domain_max_z
-    next_vz = tl.where(hit_z_min | hit_z_max, -vz, vz)
-    next_z = tl.where(hit_z_min, domain_min_z + (domain_min_z - next_z), next_z)
-    next_z = tl.where(hit_z_max, domain_max_z - (next_z - domain_max_z), next_z)
-
-    # 5. Coalesced Store from SRAM -> Global Memory (HBM)
-    tl.store(out_pos_x_ptr + offsets, next_x, mask=mask)
-    tl.store(out_pos_y_ptr + offsets, next_y, mask=mask)
-    tl.store(out_pos_z_ptr + offsets, next_z, mask=mask)
-    
-    tl.store(out_vel_x_ptr + offsets, next_vx, mask=mask)
-    tl.store(out_vel_y_ptr + offsets, next_vy, mask=mask)
-    tl.store(out_vel_z_ptr + offsets, next_vz, mask=mask)
+    # Runtime scalars are deliberately un-annotated: Triton 2.0 turns every
+    # annotated argument into a compile-time constant.
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    z = tl.load(z_ptr + offs, mask=mask)
+    vx = tl.load(vx_ptr + offs, mask=mask)
+    vy = tl.load(vy_ptr + offs, mask=mask)
+    vz = tl.load(vz_ptr + offs, mask=mask)
+    x, vx = _reflect(x + vx * dt, vx, x_lo, x_hi)
+    y, vy = _reflect(y + vy * dt, vy, y_lo, y_hi)
+    z, vz = _reflect(z + vz * dt, vz, z_lo, z_hi)
+    tl.store(x_ptr + offs, x, mask=mask)
+    tl.store(y_ptr + offs, y, mask=mask)
+    tl.store(z_ptr + offs, z, mask=mask)
+    tl.store(vx_ptr + offs, vx, mask=mask)
+    tl.store(vy_ptr + offs, vy, mask=mask)
+    tl.store(vz_ptr + offs, vz, mask=mask)
 
 
-def fused_particle_push(
-    positions_soa: dict, 
-    velocities_soa: dict, 
-    dt: float, 
-    domain_bounds: dict,
-    in_place: bool = True
-) -> tuple:
-    """
-    Host wrapper for the Triton fused push and boundary check kernel.
-    
+def fused_particle_push(positions: Sequence[torch.Tensor],
+                        velocities: Sequence[torch.Tensor], dt: float,
+                        lo: Sequence[float], hi: Sequence[float]) -> None:
+    """Advances particles in place and reflects them at the box walls.
+
     Args:
-        positions_soa: dict containing 'x', 'y', 'z' 1D torch.Tensors.
-        velocities_soa: dict containing 'u', 'v', 'w' 1D torch.Tensors.
-        dt: Time step size.
-        domain_bounds: dict containing 'min_x', 'max_x', etc.
-        in_place: If True, overwrites input tensors. If False, allocates new tensors.
-        
-    Returns:
-        tuple containing updated (positions_soa, velocities_soa).
+      positions: (x, y, z) float32 CUDA tensors of shape (N,), updated in
+        place.
+      velocities: (vx, vy, vz) float32 CUDA tensors of shape (N,), updated
+        in place.
+      dt: Time step.
+      lo: Lower box corner (x, y, z).
+      hi: Upper box corner (x, y, z).
     """
-    num_particles = positions_soa['x'].shape[0]
-    
-    # Configure output dictionaries based on in-place flag
-    out_pos = positions_soa if in_place else {k: torch.empty_like(v) for k, v in positions_soa.items()}
-    out_vel = velocities_soa if in_place else {k: torch.empty_like(v) for k, v in velocities_soa.items()}
+    n = positions[0].numel()
+    grid = (triton.cdiv(n, _BLOCK),)
+    _push_kernel[grid](*positions, *velocities, n, dt, *lo, *hi,
+                       BLOCK=_BLOCK, num_warps=4)
 
-    # Determine grid size. Block size 1024 is highly optimized for A100/H100
-    BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(num_particles, meta['BLOCK_SIZE']), )
 
-    # Launch Triton Kernel
-    _fused_push_boundary_kernel[grid](
-        positions_soa['x'], positions_soa['y'], positions_soa['z'],
-        velocities_soa['u'], velocities_soa['v'], velocities_soa['w'],
-        out_pos['x'], out_pos['y'], out_pos['z'],
-        out_vel['u'], out_vel['v'], out_vel['w'],
-        dt=dt,
-        domain_max_x=domain_bounds['max_x'], domain_max_y=domain_bounds['max_y'], domain_max_z=domain_bounds['max_z'],
-        domain_min_x=domain_bounds['min_x'], domain_min_y=domain_bounds['min_y'], domain_min_z=domain_bounds['min_z'],
-        num_particles=num_particles,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-    return out_pos, out_vel
+def reference_push(positions: Sequence[torch.Tensor],
+                   velocities: Sequence[torch.Tensor], dt: float,
+                   lo: Sequence[float], hi: Sequence[float]
+                   ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Unfused PyTorch reference of `fused_particle_push` (out of place)."""
+    new_pos, new_vel = [], []
+    for c, v, l, h in zip(positions, velocities, lo, hi):
+        c = c + v * dt
+        below, above = c < l, c > h
+        c = torch.where(below, 2.0 * l - c, c)
+        c = torch.where(above, 2.0 * h - c, c)
+        new_pos.append(c)
+        new_vel.append(torch.where(below | above, -v, v))
+    return new_pos, new_vel

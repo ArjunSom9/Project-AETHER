@@ -1,0 +1,7 @@
+# Project AETHER: CPU environment (development, CI, and the JAX test suite).
+#
+# jaxlib 0.4.14 wheels were removed from PyPI; they are still served from the
+# official JAX release index below.
+-r requirements.txt
+--find-links https://storage.googleapis.com/jax-releases/jax_releases.html
+jaxlib==0.4.14              # 2023-07-27

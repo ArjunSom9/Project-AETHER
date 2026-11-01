@@ -1,129 +1,148 @@
-"""
-Project AETHER: Differentiable Gradients Test Suite
-Validates Autodiff integrity across JAX (Physics) and PyTorch (AI) stacks.
-
-This module ensures that the "differentiable" promise of Project AETHER is met.
-It tests:
-1. JAX Navier-Stokes Gradients: Can we compute d(Residual)/d(Initial_State)?
-2. JAX Ablation Gradients: Can we compute d(Temp)/d(Conductivity)?
-3. PyTorch PINN Gradients: Does the PhysicsInformedLoss produce non-zero gradients 
-   with respect to spatial coordinates?
-"""
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Gradients flow through every differentiable stage (report Part III, 3.1)."""
 
 import jax
+from jax import experimental
 import jax.numpy as jnp
-import torch
-import unittest
+import numpy as np
 
-# --- Imports from Project AETHER ---
-try:
-    from src.physics_engine.cfd_navier_stokes import evaluate_rhs
-    from src.physics_engine.ablation_monolithic_solver import implicit_monolithic_step
-    from src.surrogate_models.physics_informed_loss import PhysicsInformedLoss
-except ImportError:
-    # Mocks for demonstration if run outside the full repository context
-    evaluate_rhs = None
-    implicit_monolithic_step = None
-    PhysicsInformedLoss = None
+from src.physics_engine import ablation_monolithic_solver
+from src.physics_engine import cfd_navier_stokes as cfd
+from src.physics_engine import chemistry_kinetics
+from src.physics_engine import dsmc_boltzmann as dsmc
+from src.surrogate_models import galerkin_transformer
+from src.surrogate_models import physics_informed_loss
 
-class TestDifferentiablePhysics(unittest.TestCase):
 
-    # -------------------------------------------------------------------------
-    # 1. JAX Navier-Stokes Gradient Test
-    # -------------------------------------------------------------------------
-    def test_navier_stokes_autodiff(self):
-        """
-        Verifies that JAX can compute gradients through the Navier-Stokes RHS.
-        Essential for optimization and stability analysis.
-        """
-        if evaluate_rhs is None:
-            self.skipTest("Navier-Stokes module not found.")
+def _finite_nonzero(tree):
+    leaves = jax.tree_util.tree_leaves(tree)
+    return (all(bool(jnp.all(jnp.isfinite(x))) for x in leaves) and
+            any(bool(jnp.any(x != 0)) for x in leaves))
 
-        # Setup 2D domain (small for testing)
-        nx, ny = 32, 32
-        dx, dy = 0.1, 0.1
-        mu = 1.0e-3
-        
-        # Conserved variables Q [rho, rhu, rhv, E]
-        Q = jnp.ones((4, ny, nx))
-        
-        # Scalar function of the physics output (e.g., total integrated energy)
-        def physics_loss(state):
-            rhs = evaluate_rhs(state, dx, dy, mu)
-            return jnp.sum(rhs**2)
 
-        # Compute gradient using jax.grad
-        grad_fn = jax.grad(physics_loss)
-        gradients = grad_fn(Q)
+def test_navier_stokes_rhs_matches_finite_differences():
+    # The minmod limiter is non-differentiable where neighboring slopes are
+    # equal or zero. Strictly monotone exponential profiles keep every cell
+    # on one branch (slope ratios differ from 1), so autodiff and central
+    # differences must agree; float64 removes rounding noise.
+    with experimental.enable_x64():
+        y, x = jnp.meshgrid(jnp.arange(8.0), jnp.arange(16.0), indexing='ij')
+        rho = jnp.exp(0.20 * x + 0.15 * y)
+        u = 20.0 * jnp.exp(0.10 * x + 0.05 * y)
+        v = 5.0 * jnp.exp(0.07 * x + 0.12 * y)
+        p = 1e5 * jnp.exp(0.05 * x + 0.03 * y)
+        q = cfd.conserved_from_primitive(rho, u, v, p)
 
-        self.assertEqual(gradients.shape, Q.shape)
-        self.assertTrue(jnp.any(gradients != 0), "Physics gradients should not be zero.")
-        print("[JAX] Navier-Stokes Differentiability: PASSED")
+        def objective(state):
+            return jnp.sum(cfd.evaluate_rhs(state, 0.1, 0.1, 1e-3)**2)
 
-    # -------------------------------------------------------------------------
-    # 2. JAX Monolithic Ablation Gradient Test
-    # -------------------------------------------------------------------------
-    def test_ablation_autodiff(self):
-        """
-        Verifies that we can differentiate through the implicit CG solve 
-        in the monolithic ablation solver.
-        """
-        if implicit_monolithic_step is None:
-            self.skipTest("Ablation solver module not found.")
+        grad = jax.grad(objective)(q)
+        direction = q * jax.random.normal(jax.random.PRNGKey(1), q.shape,
+                                          dtype=jnp.float64)
+        eps = 1e-7
+        fd = (objective(q + eps * direction) -
+              objective(q - eps * direction)) / (2.0 * eps)
+        np.testing.assert_allclose(float(jnp.vdot(grad, direction)),
+                                   float(fd), rtol=1e-4)
 
-        nx, ny = 16, 16
-        T_old = jnp.ones((ny, nx)) * 300.0
-        phi_old = jnp.ones((ny, nx)) # Pure solid
-        u = jnp.zeros((ny, nx))
-        v = jnp.zeros((ny, nx))
-        
-        # Function to minimize (e.g. minimize final temperature at the bondline)
-        def ablation_target(temp_state):
-            T_new, _ = implicit_monolithic_step(
-                temp_state, phi_old, u, v, dx=0.1, dy=0.1, dt=1e-3, cg_maxiter=10
-            )
-            return jnp.mean(T_new)
 
-        # Gradient of average temperature w.r.t initial temperature
-        grad_fn = jax.grad(ablation_target)
-        grads = grad_fn(T_old)
+def test_gradients_through_whole_simulation():
+    q = cfd.conserved_from_primitive(jnp.ones((8, 16)),
+                                     jnp.full((8, 16), 50.0),
+                                     jnp.zeros((8, 16)),
+                                     jnp.full((8, 16), 1e5))
 
-        self.assertEqual(grads.shape, T_old.shape)
-        self.assertTrue(jnp.any(grads != 0), "Ablation gradients through implicit solve: PASSED")
-        print("[JAX] Monolithic Ablation Differentiability: PASSED")
+    def final_energy(scale):
+        q_end, _ = cfd.simulate(q * scale, 5, 1e-3, 1e-3, 1e-7, 1.8e-5)
+        return jnp.sum(q_end[3])
 
-    # -------------------------------------------------------------------------
-    # 3. PyTorch Physics-Informed Loss Test
-    # -------------------------------------------------------------------------
-    def test_pinn_loss_autodiff(self):
-        """
-        Verifies that PyTorch can compute higher-order derivatives 
-        (d2_u/dx2) required for the PhysicsInformedLoss module.
-        """
-        if PhysicsInformedLoss is None:
-            self.skipTest("PhysicsInformedLoss module not found.")
+    grad = jax.grad(final_energy)(jnp.float32(1.0))
+    assert np.isfinite(float(grad)) and float(grad) != 0.0
 
-        batch, seq = 2, 64
-        # Preds: [rho, u, v, p]
-        preds = torch.randn(batch, seq, 4, requires_grad=True)
-        targets = torch.randn(batch, seq, 4)
-        # Coords: [t, x, y]
-        coords = torch.randn(batch, seq, 3, requires_grad=True)
-        
-        loss_fn = PhysicsInformedLoss(physics_weight=1.0)
-        total_loss, _, phys_loss = loss_fn(preds, targets, coords, mu=0.01)
 
-        # Backward pass through the entire PDE residual chain
-        total_loss.backward()
+def test_ablation_gradient_wrt_surface_heat_flux():
+    T = jnp.full((12, 8), 300.0)
+    phi = jnp.ones((12, 8))
+    zeros = jnp.zeros((12, 8))
 
-        # Check if coordinates have gradients (indicates PDE calculation was successful)
-        self.assertIsNotNone(coords.grad, "Coordinates should receive gradients from PDE residuals.")
-        self.assertTrue(torch.any(coords.grad != 0))
-        
-        # Check if model predictions have gradients
-        self.assertIsNotNone(preds.grad, "Model predictions should receive gradients from PINN loss.")
-        
-        print("[PyTorch] Physics-Informed Loss Differentiability: PASSED")
+    def mean_temperature(flux):
+        T_new, _ = ablation_monolithic_solver.implicit_monolithic_step(
+            T, phi, zeros, zeros, dx=1e-3, dy=1e-3, dt=0.1,
+            surface_heat_flux=flux)
+        return jnp.mean(T_new)
 
-if __name__ == '__main__':
-    unittest.main()
+    grad = jax.grad(mean_temperature)(jnp.full((8,), 1e5))
+    # Heating the surface raises the mean temperature everywhere.
+    assert bool(jnp.all(jnp.isfinite(grad))) and bool(jnp.all(grad > 0.0))
+
+
+def test_ablation_gradient_wrt_initial_temperature():
+    T = jnp.full((12, 8), 300.0).at[:2].set(3400.0)
+    phi = jnp.ones((12, 8)).at[0].set(0.0)
+    zeros = jnp.zeros((12, 8))
+    grad = jax.grad(lambda t: jnp.mean(
+        ablation_monolithic_solver.implicit_monolithic_step(
+            t, phi, zeros, zeros, dx=1e-3, dy=1e-3, dt=0.1)[0]))(T)
+    assert _finite_nonzero(grad)
+
+
+def test_relaxed_dsmc_gradient_wrt_cross_section():
+    cfg = dsmc.DsmcConfig(lo=(0.0, 0.0, 0.0), hi=(0.1, 0.1, 0.025),
+                          cells=(8, 8, 2), dt=2e-7, fnum=2e14)
+    state = dsmc.initialize_maxwellian(jax.random.PRNGKey(0), 20_000, cfg,
+                                       2000.0, drift=(-2000.0, 0.0, 0.0))
+
+    def x_kinetic_energy(d_ref):
+        out = dsmc.relaxed_dsmc_step(state, jax.random.PRNGKey(1), cfg, d_ref)
+        return jnp.mean(out.particles.vx**2)
+
+    grad = jax.grad(x_kinetic_energy)(jnp.float32(cfg.gas.d_ref))
+    assert np.isfinite(float(grad)) and float(grad) != 0.0
+
+
+def test_chemistry_jacobian_is_exact():
+    # Rates are quadratic in the concentrations, so central differences are
+    # exact up to rounding; float64 keeps that rounding far below 1e-6.
+    with experimental.enable_x64():
+        c = jnp.array([20.0, 5.0, 0.5, 1.0, 2.0], jnp.float64)
+        T, Tv = jnp.float64(9000.0), jnp.float64(6000.0)
+        jac = jax.jacfwd(chemistry_kinetics.production_rates)(c, T, Tv)
+        for i in range(5):
+            dc = jnp.zeros(5, jnp.float64).at[i].set(1e-3 * c[i])
+            fd = (chemistry_kinetics.production_rates(c + dc, T, Tv) -
+                  chemistry_kinetics.production_rates(c - dc, T, Tv)) / (
+                      2 * dc[i])
+            np.testing.assert_allclose(jac[:, i], fd, rtol=1e-6)
+
+
+def test_physics_informed_loss_gradients_reach_surrogate():
+    cfg = galerkin_transformer.GalerkinConfig(width=16, num_layers=1, modes=2,
+                                              num_heads=2)
+    params = galerkin_transformer.init_params(jax.random.PRNGKey(0), cfg)
+    q = jnp.stack([cfd.conserved_from_primitive(
+        1.0 + 0.1 * jax.random.uniform(jax.random.PRNGKey(i), (8, 8)),
+        jnp.full((8, 8), 30.0), jnp.zeros((8, 8)), jnp.full((8, 8), 1e5))
+                   for i in range(2)])
+    norm = galerkin_transformer.Normalizer.fit(q)
+    flow = physics_informed_loss.FlowSetup(dt=1e-6, dx=1e-3, dy=1e-3,
+                                           mu=1.8e-5)
+
+    def loss(p):
+        pred = galerkin_transformer.apply(p, q, norm, cfg)
+        total, _ = physics_informed_loss.loss_fn(pred, q, q, norm.std, flow,
+                                                 physics_weight=1.0)
+        return total
+
+    assert _finite_nonzero(jax.grad(loss)(params))

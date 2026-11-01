@@ -1,0 +1,3 @@
+# Google C++ style; .cu sources keep their related header first, like .cc.
+BasedOnStyle: Google
+IncludeIsMainSourceRegex: '(\.cu)$'

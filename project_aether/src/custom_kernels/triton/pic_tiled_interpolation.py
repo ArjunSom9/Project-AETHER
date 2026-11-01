@@ -1,205 +1,129 @@
-"""
-Project AETHER: Tiled Particle-In-Cell (PIC) Interpolation Kernel
-Optimized for NVIDIA Hopper/Ampere using OpenAI Triton.
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Bilinear grid-to-particle interpolation for particle-in-cell (Triton 2.0).
 
-This module implements the highly bandwidth-bound electromagnetic field 
-interpolation step (gathering E and B fields from the Eulerian grid to the 
-Lagrangian particles). 
+Gathering grid fields at particle positions is bandwidth bound and irregular.
+When particles are sorted by cell (the output order of the fused radix sort),
+the particles of one program fall into a compact patch of the grid, so the
+four corner loads of neighboring particles hit the same L1/L2 lines. The
+autotuner picks the tile size per GPU (the same source runs on A100 and
+H100).
 
-Tiling Strategy: By processing particles that are spatially sorted into 
-macro-cells, we utilize Triton's block architectures to ensure the required 
-2D/3D tiles of the EM field remain resident in the L1/SRAM cache. This 
-explicit cache awareness prevents "cache thrashing" as particles cross 
-boundaries, yielding massive speedups over legacy scattered memory access.
+`bilinear_gather` is a `@triton.jit` helper that other kernels (the fused
+Boris push in `src.physics_engine.pic_plasma_dynamics`) call directly.
+
+Typical usage example:
+
+  values = interpolate(field, x, y, cell_size=(dx, dy))
 """
+
+from collections.abc import Sequence
 
 import torch
 import triton
 import triton.language as tl
 
-# Autotuning block sizes to find the "sweet spot" between particle batch size 
-# and the resulting EM field cache footprint for different GPU architectures.
+
+@triton.jit
+def bilinear_weights(x, y, inv_dx, inv_dy, nx, ny):
+    """Base corner index and bilinear weights of positions (x, y).
+
+    Grid nodes sit at integer multiples of the cell size; positions are
+    clamped to the grid.
+
+    Returns:
+      (base, w00, w10, w01, w11), where base = iy * nx + ix indexes the
+      lower-left node of a row-major (ny, nx) grid.
+    """
+    fx = x * inv_dx
+    fy = y * inv_dy
+    ix = tl.minimum(tl.maximum(fx.to(tl.int32), 0), nx - 2)
+    iy = tl.minimum(tl.maximum(fy.to(tl.int32), 0), ny - 2)
+    wx = tl.minimum(tl.maximum(fx - ix, 0.0), 1.0)
+    wy = tl.minimum(tl.maximum(fy - iy, 0.0), 1.0)
+    base = iy * nx + ix
+    return (base, (1.0 - wx) * (1.0 - wy), wx * (1.0 - wy),
+            (1.0 - wx) * wy, wx * wy)
+
+
+@triton.jit
+def bilinear_gather(field_ptr, base, w00, w10, w01, w11, nx, mask):
+    """Interpolates a row-major (ny, nx) field from precomputed weights."""
+    f00 = tl.load(field_ptr + base, mask=mask, other=0.0)
+    f10 = tl.load(field_ptr + base + 1, mask=mask, other=0.0)
+    f01 = tl.load(field_ptr + base + nx, mask=mask, other=0.0)
+    f11 = tl.load(field_ptr + base + nx + 1, mask=mask, other=0.0)
+    return f00 * w00 + f10 * w10 + f01 * w01 + f11 * w11
+
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_PARTICLES': 1024}, num_warps=8),
-        triton.Config({'BLOCK_PARTICLES': 2048}, num_warps=8),
-        triton.Config({'BLOCK_PARTICLES': 512}, num_warps=4),
-        triton.Config({'BLOCK_PARTICLES': 4096}, num_warps=16),
+        triton.Config({'BLOCK': 256}, num_warps=2),
+        triton.Config({'BLOCK': 512}, num_warps=4),
+        triton.Config({'BLOCK': 1024}, num_warps=4),
+        triton.Config({'BLOCK': 2048}, num_warps=8),
     ],
-    key=['num_particles'],
+    key=['n'],
 )
 @triton.jit
-def _tiled_em_interpolation_kernel(
-    # Particle Position Pointers (Input, SoA layout)
-    pos_x_ptr, pos_y_ptr,
-    # Interpolated Field Pointers (Output, SoA layout)
-    out_Ex_ptr, out_Ey_ptr, out_Ez_ptr,
-    out_Bx_ptr, out_By_ptr, out_Bz_ptr,
-    # EM Grid Pointers (Input, 2D continuous flattened grids)
-    grid_Ex_ptr, grid_Ey_ptr, grid_Ez_ptr,
-    grid_Bx_ptr, grid_By_ptr, grid_Bz_ptr,
-    # Grid metadata
-    stride_x: tl.int32,
-    stride_y: tl.int32,
-    grid_size_x: tl.int32,
-    grid_size_y: tl.int32,
-    dx: tl.float32,
-    dy: tl.float32,
-    # Meta-parameters
-    num_particles: tl.int32,
-    BLOCK_PARTICLES: tl.constexpr
-):
-    """
-    Triton kernel for Bilinear Interpolation of Electromagnetic Fields.
-    Assumes particles are pre-sorted by spatial macro-cells so that memory 
-    accesses to the EM grid heavily hit the L1/SRAM cache.
-    """
-    # Identify thread block and local particle offsets
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_PARTICLES
-    p_offsets = block_start + tl.arange(0, BLOCK_PARTICLES)
-    
-    # Mask to prevent out-of-bounds execution on the final block
-    p_mask = p_offsets < num_particles
-
-    # 1. Load Particle Positions
-    x = tl.load(pos_x_ptr + p_offsets, mask=p_mask)
-    y = tl.load(pos_y_ptr + p_offsets, mask=p_mask)
-
-    # 2. Map continuous positions to discrete grid indices (bottom-left corner)
-    # Using normalized coordinates
-    norm_x = x / dx
-    norm_y = y / dy
-    
-    idx_x = tl.cast(norm_x, tl.int32)
-    idx_y = tl.cast(norm_y, tl.int32)
-
-    # Clamp indices to prevent segmentation faults at domain boundaries
-    # We leave room for idx_x + 1 by clamping to grid_size - 2
-    idx_x = tl.where(idx_x < 0, 0, tl.where(idx_x >= grid_size_x - 1, grid_size_x - 2, idx_x))
-    idx_y = tl.where(idx_y < 0, 0, tl.where(idx_y >= grid_size_y - 1, grid_size_y - 2, idx_y))
-
-    # 3. Calculate interpolation weights (bilinear)
-    # Fractional distances from the bottom-left corner
-    wx = norm_x - idx_x
-    wy = norm_y - idx_y
-    
-    w00 = (1.0 - wx) * (1.0 - wy)
-    w10 = wx * (1.0 - wy)
-    w01 = (1.0 - wx) * wy
-    w11 = wx * wy
-
-    # 4. Calculate memory offsets for the 4 corners of the surrounding cell
-    # Grid is shape (grid_size_x, grid_size_y), flattened.
-    base_idx = (idx_x * stride_x) + (idx_y * stride_y)
-    
-    idx_00 = base_idx
-    idx_10 = base_idx + stride_x
-    idx_01 = base_idx + stride_y
-    idx_11 = base_idx + stride_x + stride_y
-
-    # 5. Gather EM Fields from the Grid
-    # Because particles in this BLOCK_PARTICLES are spatially sorted, these 4 
-    # memory loads act on a highly localized tile, maintaining ~99% L1 cache hit rates.
-    
-    # Electric Field Gather
-    Ex_00 = tl.load(grid_Ex_ptr + idx_00, mask=p_mask)
-    Ex_10 = tl.load(grid_Ex_ptr + idx_10, mask=p_mask)
-    Ex_01 = tl.load(grid_Ex_ptr + idx_01, mask=p_mask)
-    Ex_11 = tl.load(grid_Ex_ptr + idx_11, mask=p_mask)
-    Ex_interp = (Ex_00 * w00) + (Ex_10 * w10) + (Ex_01 * w01) + (Ex_11 * w11)
-
-    Ey_00 = tl.load(grid_Ey_ptr + idx_00, mask=p_mask)
-    Ey_10 = tl.load(grid_Ey_ptr + idx_10, mask=p_mask)
-    Ey_01 = tl.load(grid_Ey_ptr + idx_01, mask=p_mask)
-    Ey_11 = tl.load(grid_Ey_ptr + idx_11, mask=p_mask)
-    Ey_interp = (Ey_00 * w00) + (Ey_10 * w10) + (Ey_01 * w01) + (Ey_11 * w11)
-
-    Ez_00 = tl.load(grid_Ez_ptr + idx_00, mask=p_mask)
-    Ez_10 = tl.load(grid_Ez_ptr + idx_10, mask=p_mask)
-    Ez_01 = tl.load(grid_Ez_ptr + idx_01, mask=p_mask)
-    Ez_11 = tl.load(grid_Ez_ptr + idx_11, mask=p_mask)
-    Ez_interp = (Ez_00 * w00) + (Ez_10 * w10) + (Ez_01 * w01) + (Ez_11 * w11)
-
-    # Magnetic Field Gather
-    Bx_00 = tl.load(grid_Bx_ptr + idx_00, mask=p_mask)
-    Bx_10 = tl.load(grid_Bx_ptr + idx_10, mask=p_mask)
-    Bx_01 = tl.load(grid_Bx_ptr + idx_01, mask=p_mask)
-    Bx_11 = tl.load(grid_Bx_ptr + idx_11, mask=p_mask)
-    Bx_interp = (Bx_00 * w00) + (Bx_10 * w10) + (Bx_01 * w01) + (Bx_11 * w11)
-
-    By_00 = tl.load(grid_By_ptr + idx_00, mask=p_mask)
-    By_10 = tl.load(grid_By_ptr + idx_10, mask=p_mask)
-    By_01 = tl.load(grid_By_ptr + idx_01, mask=p_mask)
-    By_11 = tl.load(grid_By_ptr + idx_11, mask=p_mask)
-    By_interp = (By_00 * w00) + (By_10 * w10) + (By_01 * w01) + (By_11 * w11)
-
-    Bz_00 = tl.load(grid_Bz_ptr + idx_00, mask=p_mask)
-    Bz_10 = tl.load(grid_Bz_ptr + idx_10, mask=p_mask)
-    Bz_01 = tl.load(grid_Bz_ptr + idx_01, mask=p_mask)
-    Bz_11 = tl.load(grid_Bz_ptr + idx_11, mask=p_mask)
-    Bz_interp = (Bz_00 * w00) + (Bz_10 * w10) + (Bz_01 * w01) + (Bz_11 * w11)
-
-    # 6. Store Interpolated Fields to HBM (SoA layout)
-    tl.store(out_Ex_ptr + p_offsets, Ex_interp, mask=p_mask)
-    tl.store(out_Ey_ptr + p_offsets, Ey_interp, mask=p_mask)
-    tl.store(out_Ez_ptr + p_offsets, Ez_interp, mask=p_mask)
-    
-    tl.store(out_Bx_ptr + p_offsets, Bx_interp, mask=p_mask)
-    tl.store(out_By_ptr + p_offsets, By_interp, mask=p_mask)
-    tl.store(out_Bz_ptr + p_offsets, Bz_interp, mask=p_mask)
+def _interpolate_kernel(field_ptr, x_ptr, y_ptr, out_ptr, n, inv_dx, inv_dy,
+                        nx, ny, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offs, mask=mask, other=0.0)
+    base, w00, w10, w01, w11 = bilinear_weights(x, y, inv_dx, inv_dy, nx, ny)
+    value = bilinear_gather(field_ptr, base, w00, w10, w01, w11, nx, mask)
+    tl.store(out_ptr + offs, value, mask=mask)
 
 
-def interpolate_em_fields_tiled(
-    positions_soa: dict, 
-    em_grid_soa: dict, 
-    grid_shape: tuple, 
-    cell_size: tuple
-) -> dict:
-    """
-    Host wrapper for the Triton PIC Bilinear Interpolation kernel.
-    
+def interpolate(field: torch.Tensor, x: torch.Tensor, y: torch.Tensor,
+                cell_size: Sequence[float]) -> torch.Tensor:
+    """Bilinear interpolation of a node-centered 2D field at particles.
+
     Args:
-        positions_soa: dict containing 1D torch.Tensors 'x', 'y' for particle positions.
-        em_grid_soa: dict containing 2D torch.Tensors 'Ex', 'Ey', 'Ez', 'Bx', 'By', 'Bz'.
-        grid_shape: tuple of (nx, ny) representing the grid dimensions.
-        cell_size: tuple of (dx, dy) representing the physical size of a grid cell.
-        
+      field: Contiguous float32 CUDA tensor of shape (ny, nx), ny, nx >= 2.
+      x: Particle x positions, float32 CUDA tensor (N,).
+      y: Particle y positions, float32 CUDA tensor (N,).
+      cell_size: Grid spacing (dx, dy).
+
     Returns:
-        dict containing interpolated 1D torch.Tensors for each particle: 
-        'Ex', 'Ey', 'Ez', 'Bx', 'By', 'Bz'.
+      Interpolated values, float32 (N,).
     """
-    num_particles = positions_soa['x'].shape[0]
-    nx, ny = grid_shape
-    dx, dy = cell_size
-    
-    # Ensure inputs are contiguous to match stride assumptions
-    stride_x = em_grid_soa['Ex'].stride(0)
-    stride_y = em_grid_soa['Ex'].stride(1)
+    ny, nx = field.shape
+    n = x.numel()
+    out = torch.empty_like(x)
 
-    # Allocate Output SoA
-    out_fields = {
-        'Ex': torch.empty_like(positions_soa['x']),
-        'Ey': torch.empty_like(positions_soa['x']),
-        'Ez': torch.empty_like(positions_soa['x']),
-        'Bx': torch.empty_like(positions_soa['x']),
-        'By': torch.empty_like(positions_soa['x']),
-        'Bz': torch.empty_like(positions_soa['x']),
-    }
+    def grid(meta):
+        return (triton.cdiv(n, meta['BLOCK']),)
 
-    # The @triton.autotune decorator will automatically optimize BLOCK_PARTICLES
-    grid = lambda meta: (triton.cdiv(num_particles, meta['BLOCK_PARTICLES']),)
+    _interpolate_kernel[grid](field.contiguous(), x, y, out, n,
+                              1.0 / cell_size[0], 1.0 / cell_size[1], nx, ny)
+    return out
 
-    # Launch Kernel
-    _tiled_em_interpolation_kernel[grid](
-        positions_soa['x'], positions_soa['y'],
-        out_fields['Ex'], out_fields['Ey'], out_fields['Ez'],
-        out_fields['Bx'], out_fields['By'], out_fields['Bz'],
-        em_grid_soa['Ex'], em_grid_soa['Ey'], em_grid_soa['Ez'],
-        em_grid_soa['Bx'], em_grid_soa['By'], em_grid_soa['Bz'],
-        stride_x, stride_y,
-        nx, ny, dx, dy,
-        num_particles
-    )
 
-    return out_fields
+def reference_interpolate(field: torch.Tensor, x: torch.Tensor,
+                          y: torch.Tensor,
+                          cell_size: Sequence[float]) -> torch.Tensor:
+    """PyTorch reference of `interpolate` (also runs on CPU)."""
+    ny, nx = field.shape
+    fx, fy = x / cell_size[0], y / cell_size[1]
+    ix = fx.to(torch.int32).clamp(0, nx - 2)
+    iy = fy.to(torch.int32).clamp(0, ny - 2)
+    wx = (fx - ix).clamp(0.0, 1.0)
+    wy = (fy - iy).clamp(0.0, 1.0)
+    f = field.reshape(-1)
+    base = (iy * nx + ix).long()
+    return (f[base] * (1 - wx) * (1 - wy) + f[base + 1] * wx * (1 - wy) +
+            f[base + nx] * (1 - wx) * wy + f[base + nx + 1] * wx * wy)

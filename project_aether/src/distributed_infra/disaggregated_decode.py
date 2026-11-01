@@ -1,180 +1,173 @@
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Decode pool of the disaggregated serving system (report Part VI, 6.1-6.2).
+
+Decode is memory-bandwidth bound: every step reads the whole key/value
+history to produce one token per sequence, so throughput comes from large,
+long-lived batches. The decode pool therefore:
+
+  * receives prefilled state from the prefill pool as whole cache blocks
+    (`admit`), transferring them onto its own devices,
+  * keeps that state in a PagedAttention cache, where waste is limited to each
+    sequence's partially filled last block, so many sequences fit at once,
+  * forks what-if branches by sharing blocks (copy-on-write), so a branch
+    costs a block-table copy rather than a state copy,
+  * runs continuous (iteration-level) batching: sequences join and leave the
+    batch at every step.
+
+Typical usage example:
+
+  worker = DecodeWorker(params, cfg, jax.devices()[4:])
+  worker.admit(completed_prefill, request_id=0, max_new_tokens=32)
+  finished = worker.step()
 """
-Project AETHER: Disaggregated Serving - Decode Node
-Optimized for Memory-Bound A100/L40/L4 clusters.
 
-The Decode Cluster is responsible for the real-time autoregressive prediction
-of the hypersonic flight envelope. It receives high-fidelity physical context 
-(KV-caches) from the compute-heavy Prefill nodes and utilizes quantized FP8 
-Transformers to "decode" future flow states token-by-token.
+import collections
+import dataclasses
+from typing import Any
 
-Key Optimization:
-PagedAttention (inspired by vLLM) is used to manage the "physics state cache," 
-preventing memory fragmentation as the simulation history grows during 
-long-duration "weather" encounters.
-"""
+import jax
+import numpy as np
 
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-import time
-from typing import Dict, List, Optional, Tuple
+from src.distributed_infra import disaggregated_prefill
+from src.distributed_infra import kv_paged_attention
+from src.distributed_infra import model_runner
+from src.surrogate_models import trajectory_transformer
 
-# Import surrogate model components for inference
-try:
-    from src.surrogate_models.pit_star_attention import PhysicsInformedTransformerLayer
-    from src.surrogate_models.quantization_fp8 import PhysicalResidualLinear
-except ImportError:
-    PhysicsInformedTransformerLayer = None
-    PhysicalResidualLinear = None
 
-class PhysicsPagedCache:
+@dataclasses.dataclass
+class DecodeSequence:
+    """A sequence being rolled forward on the decode pool.
+
+    Attributes:
+      seq_id: Cache sequence identifier.
+      request_id: Request the sequence belongs to.
+      next_input: Token fed to the next decode step, (F,).
+      remaining: Tokens still to generate.
+      outputs: Generated tokens so far.
     """
-    A PagedAttention memory manager for physical states.
-    Allows non-contiguous memory allocation for different regions of the 
-    unstructured mesh, preventing the 'memory wall' and fragmentation.
-    """
-    def __init__(self, num_blocks: int, block_size: int, head_dim: int):
-        self.block_size = block_size
-        self.head_dim = head_dim
-        
-        # Physical cache blocks residing in HBM [NumBlocks, BlockSize, HeadDim]
-        # These store the Keys and Values for the Transformer attention mechanism
-        self.k_cache = torch.zeros(num_blocks, block_size, head_dim, device='cuda')
-        self.v_cache = torch.zeros(num_blocks, block_size, head_dim, device='cuda')
-        
-        self.free_blocks = list(range(num_blocks))
-        self.block_table = {} # Mapping: mesh_region_id -> list of physical block indices
+    seq_id: int
+    request_id: int
+    next_input: np.ndarray
+    remaining: int
+    outputs: list[np.ndarray] = dataclasses.field(default_factory=list)
 
-    def allocate_blocks_for_region(self, region_id: str, num_required: int):
-        if len(self.free_blocks) < num_required:
-            raise MemoryError("Physics PagedAttention cache exhausted.")
-        
-        new_blocks = [self.free_blocks.pop(0) for _ in range(num_required)]
-        if region_id not in self.block_table:
-            self.block_table[region_id] = []
-        self.block_table[region_id].extend(new_blocks)
-        return new_blocks
 
-class DisaggregatedDecodeNode:
-    """
-    The main serving node for real-time hypersonic prediction.
-    """
-    def __init__(self, prefill_rank_mapping: Dict[int, int], embed_dim: int = 1024):
-        if not dist.is_initialized():
-            raise RuntimeError("torch.distributed must be initialized for Disaggregated Decoding.")
+def branch_input(token: np.ndarray, branch_index: int) -> np.ndarray:
+    """Deterministically perturbed starting token of a what-if branch."""
+    return token * (1.0 + 0.01 * (branch_index + 1))
 
-        self.rank = dist.get_rank()
-        self.prefill_sources = prefill_rank_mapping
-        self.embed_dim = embed_dim
-        
-        # Initialize the Surrogate Model stack (quantized to FP8)
-        if PhysicsInformedTransformerLayer is not None:
-            self.model_layers = nn.ModuleList([
-                PhysicsInformedTransformerLayer(hidden_dim=embed_dim, ffn_dim=embed_dim*4).cuda()
-                for _ in range(6) # Deep surrogate for complex non-equilibrium chemistry
-            ])
-        else:
-            self.model_layers = None
 
-        # Paged Cache for the simulation history
-        self.paged_cache = PhysicsPagedCache(num_blocks=4096, block_size=16, head_dim=64)
-        
-    def wait_for_simulation_context(self, source_rank: int, seq_len: int) -> torch.Tensor:
-        """
-        Blocks until the Prefill (Simulator) node transmits the initial state.
-        This state serves as the 'prompt' for the autoregressive predictor.
-        """
-        # Buffer to receive the high-fidelity tokenized state [1, SeqLen, EmbedDim]
-        context_buffer = torch.zeros(1, seq_len, self.embed_dim, device='cuda')
-        
-        print(f"[Decode Rank {self.rank}] Awaiting physics context from Prefill Rank {source_rank}...")
-        
-        # Synchronous receive (matches dist.isend from Prefill)
-        dist.recv(tensor=context_buffer, src=source_rank)
-        
-        print(f"[Decode Rank {self.rank}] Context received. Initializing trajectory prediction.")
-        return context_buffer
+class DecodeWorker:
+    """Continuous-batching decode on its own device pool."""
 
-    def flash_attention_disaggregated(self, query: torch.Tensor, kv_cache: torch.Tensor) -> torch.Tensor:
-        """
-        Custom FlashAttention implementation for disaggregated caches.
-        Gather tokens across neighboring decode GPUs using SCCL topologies.
-        """
-        # In this disaggregated context, the 'KV' is the entire simulation history
-        # we gathered from the simulator node.
-        # We use PyTorch's optimized scaled_dot_product_attention (utilizing FlashAttention)
-        return torch.nn.functional.scaled_dot_product_attention(
-            query, kv_cache, kv_cache, dropout_p=0.0, is_causal=True
-        )
+    def __init__(self, params: Any,
+                 cfg: trajectory_transformer.TrajectoryConfig,
+                 devices: list[jax.Device], num_blocks: int = 1024,
+                 block_size: int = 16, max_batch: int = 64):
+        """Initializes the worker.
 
-    def run_inference_step(self, current_token: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        Args:
+          params: Unsharded model parameters.
+          cfg: Model configuration.
+          devices: Devices of the decode pool.
+          num_blocks: Physical cache blocks on the pool.
+          block_size: Token slots per block; must match the prefill pool.
+          max_batch: Maximum sequences per decode iteration.
         """
-        Predicts the next physical state based on current history.
-        """
-        x = current_token
-        
-        # Pass through the surrogate stack
-        for layer in self.model_layers:
-            # Note: In a production PIT, the attention inside these layers 
-            # would be replaced with the `flash_attention_disaggregated` call 
-            # above to properly utilize the Paged Cache.
-            x = layer(x)
-            
-        return x
+        self.cfg = cfg
+        self.mesh = model_runner.tensor_mesh(devices)
+        self.params = model_runner.shard_params(params, self.mesh)
+        self._kv_sharding = model_runner.kv_sharding(self.mesh)
+        self.cache = kv_paged_attention.PagedKVCache(
+            cfg.num_layers, num_blocks, block_size, cfg.num_heads,
+            cfg.head_dim, sharding=self._kv_sharding)
+        self.max_batch = max_batch
+        self._active: collections.deque[DecodeSequence] = collections.deque()
 
-    def start_digital_twin_loop(self, source_rank: int, mesh_size: int, horizon: int = 100):
+    @property
+    def busy(self) -> bool:
+        return bool(self._active)
+
+    def can_admit(self, done: disaggregated_prefill.CompletedPrefill) -> bool:
+        return done.k_blocks.shape[1] <= self.cache.allocator.num_free
+
+    def admit(self, done: disaggregated_prefill.CompletedPrefill,
+              request_id: int, max_new_tokens: int,
+              branch_ids: tuple[int, ...] = ()) -> list[DecodeSequence]:
+        """Takes over a prefilled sequence (and optional what-if branches).
+
+        Args:
+          done: Prefill result, still resident on the prefill pool.
+          request_id: Request the sequence belongs to.
+          max_new_tokens: Tokens to generate, including the first prediction.
+          branch_ids: Sequence ids of extra branches forked from the same
+            prefilled state.
+
+        Returns:
+          The new decode sequences (main sequence first).
         """
-        The main autoregressive serving loop.
-        """
-        # 1. Block for physical truth (Prefill)
-        history = self.wait_for_simulation_context(source_rank, mesh_size)
-        
-        # 2. Extract initial prediction token (the 'current' state)
-        current_state = history[:, -1:, :]
-        
-        predictions = []
-        for step in range(horizon):
-            start_ts = time.time()
-            
-            # Autoregressive Prediction
-            if self.model_layers:
-                next_state = self.run_inference_step(current_state, history)
+        # The handoff: move the blocks onto the decode pool's devices.
+        k_blocks = jax.device_put(done.k_blocks, self._kv_sharding)
+        v_blocks = jax.device_put(done.v_blocks, self._kv_sharding)
+        self.cache.import_blocks(done.seq_id, k_blocks, v_blocks,
+                                 done.num_tokens)
+        first = done.first_prediction
+        sequences = [DecodeSequence(done.seq_id, request_id, first,
+                                    max_new_tokens - 1, [first])]
+        for i, branch_id in enumerate(branch_ids):
+            self.cache.fork(done.seq_id, branch_id)
+            start = branch_input(first, i)
+            sequences.append(DecodeSequence(branch_id, request_id, start,
+                                            max_new_tokens - 1, [start]))
+        for seq in sequences:
+            if seq.remaining > 0:
+                self._active.append(seq)
             else:
-                # Mock inference for environments without surrogate logic
-                next_state = torch.randn_like(current_state)
-            
-            # Update history with the predicted future token
-            # PagedAttention would allocate new blocks here if needed
-            history = torch.cat([history, next_state], dim=1)
-            current_state = next_state
-            
-            latency_ms = (time.time() - start_ts) * 1000
-            
-            if step % 20 == 0:
-                print(f"[Decode Rank {self.rank}] Prediction Step {step}/{horizon} | Latency: {latency_ms:.2f}ms")
-            
-            predictions.append(next_state)
-            
-        print(f"[Decode Rank {self.rank}] Flight trajectory prediction complete.")
-        return predictions
+                self.cache.free(seq.seq_id)
+        return sequences
 
-if __name__ == "__main__":
-    # Mock distributed environment setup
-    import os
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    os.environ['RANK'] = '1'
-    os.environ['WORLD_SIZE'] = '2' # 1 Simulator, 1 Predictor
-    
-    try:
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
-        
-        # Map Decode Rank 1 back to Prefill Rank 0 source
-        node = DisaggregatedDecodeNode(prefill_rank_mapping={1: 0})
-        
-        # Simulate tracking a mesh of 50,000 points
-        node.start_digital_twin_loop(source_rank=0, mesh_size=50000)
-        
-        dist.destroy_process_group()
-    except Exception as e:
-        print(f"Distributed context not found: {e}")
+    def step(self) -> list[DecodeSequence]:
+        """Runs one decode iteration over up to `max_batch` sequences.
+
+        Returns:
+          Sequences that finished in this iteration.
+        """
+        if not self._active:
+            return []
+        batch = []
+        while self._active and len(batch) < self.max_batch:
+            seq = self._active.popleft()
+            if self.cache.blocks_needed(seq.seq_id, 1) > (
+                    self.cache.allocator.num_free):
+                self._active.appendleft(seq)
+                break
+            batch.append(seq)
+        if not batch:
+            raise kv_paged_attention.CacheExhaustedError(
+                'Decode pool cannot make progress: no free blocks.')
+        predictions = model_runner.run_batch(
+            self.params, self.cache, self.cfg, [s.seq_id for s in batch],
+            [s.next_input[None] for s in batch], self.mesh)
+        finished = []
+        for seq, pred in zip(batch, predictions):
+            seq.next_input = pred[0]
+            seq.outputs.append(pred[0])
+            seq.remaining -= 1
+            if seq.remaining == 0:
+                self.cache.free(seq.seq_id)
+                finished.append(seq)
+            else:
+                self._active.append(seq)
+        return finished

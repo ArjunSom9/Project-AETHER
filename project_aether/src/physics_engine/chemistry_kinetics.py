@@ -1,149 +1,162 @@
-"""
-Project AETHER: Chemical Kinetics & Multi-Temperature Air Plasma Model
-Optimized for JAX and TMA (Tensor Memory Accelerator) Acceleration.
+# Copyright 2023 The Project AETHER Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Five-species air chemistry with Park's two-temperature model in JAX.
 
-This module implements Park's Two-Temperature model (Translational-Rotational T_tr 
-and Vibrational-Electron T_ve) for hypersonic non-equilibrium gas dynamics. 
+Species are (N2, O2, NO, N, O). Forward rate coefficients follow
+C. Park, "Review of chemical-kinetic problems of future NASA missions, I:
+Earth entries", J. Thermophysics and Heat Transfer 7(3), 1993:
 
-It calculates stiff chemical production rates (dissociation, ionization) and constructs 
-the sparse Jacobian matrices. It then offloads the massive matrix multiplications to the 
-bare-metal NVIDIA Hopper TMA via JAX Pallas.
+  k_f = A T_c^n exp(-theta / T_c),
+
+with the rate-controlling temperature T_c = sqrt(T * T_v) for the three
+dissociation reactions and T_c = T for the two Zeldovich exchanges. Third
+bodies have species-dependent efficiencies (molecules vs. atoms).
+
+Only forward rates are modeled. That is appropriate for the
+dissociation-dominated relaxation zone just behind a strong bow shock;
+recombination (backward rates from equilibrium constants) is out of scope.
+
+Each reaction conserves N and O atoms, and `implicit_step` integrates the
+stiff system with backward Euler, using `jax.jacfwd` for the exact Jacobian.
+Newton's method on that system preserves elemental composition to round-off.
+
+Typical usage example:
+
+  c_next = chemistry_kinetics.implicit_step(c, T, Tv, dt=1e-6)
 """
+
+import functools
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import pallas as pl
-from functools import partial
+import numpy as np
 
-# Attempt to import the decoupled bare-metal Pallas kernel
-try:
-    from src.custom_kernels.pallas.tma_software_pipeline import block_sparse_gemm_kernel
-except ImportError:
-    block_sparse_gemm_kernel = None
-    print("Warning: Pallas TMA kernel not found. Defaulting to standard jnp.dot.")
+SPECIES = ('N2', 'O2', 'NO', 'N', 'O')
+MOLAR_MASS = np.array([28.0134e-3, 31.9988e-3, 30.0061e-3, 14.0067e-3,
+                       15.9994e-3])  # [kg/mol]
 
-# --- Physical Constants for 5-Species Air Model (N2, O2, NO, N, O) ---
-UNIVERSAL_GAS_CONST = 8.314 # J/(mol K)
+# cm^3/(mol s) -> m^3/(mol s).
+_CM3_TO_M3 = 1e-6
 
-# Arrhenius coefficients (Mock values for N2 dissociation: N2 + M -> 2N + M)
-# Format: [A (pre-exponential), n (temperature exponent), E_a (Activation Energy in K)]
-ARRHENIUS_COEFFS = {
-    'N2_dissociation': jnp.array([3.0e22, -1.6, 113200.0]),
-    'O2_dissociation': jnp.array([2.0e21, -1.5, 59500.0]),
-    'NO_exchange': jnp.array([3.2e17, 0.0, 38400.0])
-}
+# Pre-exponential factors of the third-body reactions, indexed by the
+# collision partner M in SPECIES order (Park 1993, Table 2).
+_A_N2_DISSOCIATION = np.array([7.0e21, 7.0e21, 7.0e21, 3.0e22, 3.0e22])
+_A_O2_DISSOCIATION = np.array([2.0e21, 2.0e21, 2.0e21, 1.0e22, 1.0e22])
+_A_NO_DISSOCIATION = np.array([5.0e15, 5.0e15, 1.1e17, 1.1e17, 1.1e17])
 
-@jax.jit
-def parks_two_temperature_model(T_tr: jnp.ndarray, T_ve: jnp.ndarray) -> jnp.ndarray:
-    """
-    Computes the effective rate-controlling temperature for dissociation reactions
-    using Park's Two-Temperature model: T_eff = sqrt(T_tr * T_ve).
-    
-    In strong hypersonic shocks, T_tr spikes immediately while T_ve lags, 
-    delaying dissociation.
-    """
-    return jnp.sqrt(T_tr * T_ve)
+# (n, theta [K]) of the five reactions.
+_N2_DISSOCIATION = (-1.6, 113200.0)
+_O2_DISSOCIATION = (-1.5, 59500.0)
+_NO_DISSOCIATION = (0.0, 75500.0)
+_ZELDOVICH_1 = (6.4e17, -1.0, 38400.0)  # N2 + O -> NO + N
+_ZELDOVICH_2 = (8.4e12, 0.0, 19450.0)  # NO + O -> N + O2
 
-@jax.jit
-def arrhenius_rate(T_eff: jnp.ndarray, coeffs: jnp.ndarray) -> jnp.ndarray:
-    """
-    Calculates the forward reaction rate coefficient k_f.
-    k_f = A * T^n * exp(-E_a / T)
-    """
-    A, n, E_a = coeffs[0], coeffs[1], coeffs[2]
-    # Add small epsilon to temperature to avoid log(0) or division by zero
-    T_safe = jnp.clip(T_eff, 1e-3, None)
-    
-    k_f = A * jnp.power(T_safe, n) * jnp.exp(-E_a / T_safe)
-    return k_f
+# Stoichiometric matrix: rows are species, columns are reactions
+# (N2 diss., O2 diss., NO diss., Zeldovich 1, Zeldovich 2).
+STOICHIOMETRY = np.array([
+    [-1, 0, 0, -1, 0],  # N2
+    [0, -1, 0, 0, 1],  # O2
+    [0, 0, -1, 1, -1],  # NO
+    [2, 0, 1, 1, 1],  # N
+    [0, 2, 1, -1, -1],  # O
+], dtype=np.float32)
 
-@jax.jit
-def compute_species_production_rates(
-    concentrations: jnp.ndarray, 
-    T_tr: jnp.ndarray, 
-    T_ve: jnp.ndarray
-) -> jnp.ndarray:
-    """
-    Evaluates the source terms (omega_dot) for each chemical species.
-    This creates the highly non-linear, stiff ODE system that requires implicit solving.
-    """
-    T_eff = parks_two_temperature_model(T_tr, T_ve)
-    
-    # Calculate rates
-    k_f_N2 = arrhenius_rate(T_eff, ARRHENIUS_COEFFS['N2_dissociation'])
-    k_f_O2 = arrhenius_rate(T_eff, ARRHENIUS_COEFFS['O2_dissociation'])
-    
-    # Extract species (Mock indices: 0=N2, 1=O2, 2=NO, 3=N, 4=O)
-    rho_N2 = concentrations[..., 0]
-    rho_O2 = concentrations[..., 1]
-    
-    # Simplified production rates (Forward only for demonstration)
-    # N2 + M -> 2N + M (assuming M is roughly proportional to total density, simplified here)
-    rate_N2 = -k_f_N2 * rho_N2
-    rate_O2 = -k_f_O2 * rho_O2
-    rate_N = -2.0 * rate_N2
-    rate_O = -2.0 * rate_O2
-    rate_NO = jnp.zeros_like(rate_N2) # Placeholder for exchange reactions
-    
-    omega_dot = jnp.stack([rate_N2, rate_O2, rate_NO, rate_N, rate_O], axis=-1)
-    return omega_dot
+# Atoms of (N, O) in each species; ELEMENTS @ STOICHIOMETRY == 0.
+ELEMENTS = np.array([[2, 0, 1, 1, 0], [0, 2, 1, 0, 1]], dtype=np.float32)
 
-def build_kinetics_jacobian(omega_dot: jnp.ndarray):
-    """
-    Constructs the block-sparse Jacobian matrices (X and Y) for the implicit 
-    time integration of the chemical kinetics.
-    
-    In a real 11-species or 22-species plasma model, this matrix is massive 
-    and highly sparse. We use Reverse Cuthill-McKee ordering conceptually here 
-    to cluster the non-zeros.
-    """
-    # For demonstration, we shape the matrices to fit the TMA 1024x1024 pipeline
-    # In reality, these are populated by the analytical or autodiff gradients of omega_dot
-    num_cells = omega_dot.shape[0]
-    
-    # Mocks the generation of the Stiff ODE Jacobian components
-    x = jnp.ones((1024, 1024), dtype=jnp.float32) * omega_dot.mean()
-    y = jnp.ones((1024, 1024), dtype=jnp.float32) * 0.5
-    
-    # Create the block-adjacency matrix (Sparsity Mask)
-    # Only species that physically react with each other get a '1'
-    key = jax.random.PRNGKey(42)
-    sparsity_mask = jax.random.bernoulli(key, p=0.15, shape=(1024, 1024)).astype(jnp.int32)
-    
-    return x, y, sparsity_mask
+_MIN_TEMPERATURE = 50.0
 
-def run_kinetics_pipeline(x: jax.Array, y: jax.Array, sparsity_mask: jax.Array):
-    """
-    Configures the JAX Pallas environment, BlockSpecs, and launches the TMA kernel.
-    This acts as the bridge between the high-level chemistry physics and the 
-    bare-metal Hopper GPU accelerators.
-    """
-    if block_sparse_gemm_kernel is None:
-        # Fallback to standard JAX matrix multiplication if Pallas kernel is missing
-        # (e.g., running on non-Hopper hardware or CPU)
-        return jnp.dot(x, y) * sparsity_mask
 
-    M, K = x.shape
-    _, N = y.shape
-    
-    # Define optimal tile sizes for Hopper Tensor Memory Accelerator (TMA)
-    BM, BN, BK = 128, 128, 64
-    
-    # Configure BlockSpecs to instruct the TMA on how to slice the global tensors
-    # into SRAM blocks asynchronously.
-    grid = (M // BM, N // BN, K // BK)
-    out_shape = jax.ShapeDtypeStruct((M, N), jnp.float32)
+def arrhenius(T_c: jax.Array, A: float | jax.Array, n: float,
+              theta: float) -> jax.Array:
+    """Modified Arrhenius rate A T_c^n exp(-theta / T_c) in m^3/(mol s)."""
+    T_c = jnp.maximum(T_c, _MIN_TEMPERATURE)
+    return _CM3_TO_M3 * A * jnp.exp(n * jnp.log(T_c) - theta / T_c)
 
-    # Launch Pallas Kernel using the decoupled block_sparse_gemm_kernel
-    return pl.pallas_call(
-        block_sparse_gemm_kernel,
-        grid=grid,
-        out_shape=out_shape,
-        in_specs=[
-            pl.BlockSpec(lambda m, n, k: (m, k), (BM, BK)),
-            pl.BlockSpec(lambda m, n, k: (k, n), (BK, BN)),
-            pl.BlockSpec(lambda m, n, k: (m, n), (1, 1))  # Sparsity mask spec
-        ],
-        out_specs=pl.BlockSpec(lambda m, n, k: (m, n), (BM, BN)),
-        compiler_params={"ptxas_options": ["-O3"]}, # Ensure aggressive optimization at PTX level
-    )(x, y, sparsity_mask, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK)
+
+def production_rates(c: jax.Array, T: jax.Array, Tv: jax.Array) -> jax.Array:
+    """Net molar production rates omega_dot [mol/(m^3 s)].
+
+    Args:
+      c: Molar concentrations [mol/m^3], shape (..., 5).
+      T: Translational-rotational temperature [K], shape (...).
+      Tv: Vibrational-electronic temperature [K], shape (...).
+
+    Returns:
+      omega_dot with the shape of `c`.
+    """
+    T_a = jnp.sqrt(T * Tv)[..., None]  # Park's dissociation temperature.
+    n2, o2, no, _, o = (c[..., i] for i in range(5))
+
+    def third_body(A_m, n, theta):
+        # sum over M of k_M [M]; A_m broadcasts over the species axis.
+        return jnp.sum(arrhenius(T_a, jnp.asarray(A_m, c.dtype), n, theta) * c,
+                       axis=-1)
+
+    r = jnp.stack([
+        third_body(_A_N2_DISSOCIATION, *_N2_DISSOCIATION) * n2,
+        third_body(_A_O2_DISSOCIATION, *_O2_DISSOCIATION) * o2,
+        third_body(_A_NO_DISSOCIATION, *_NO_DISSOCIATION) * no,
+        arrhenius(T, *_ZELDOVICH_1) * n2 * o,
+        arrhenius(T, *_ZELDOVICH_2) * no * o,
+    ], axis=-1)
+    return r @ jnp.asarray(STOICHIOMETRY.T, c.dtype)
+
+
+def _implicit_cell(c_old: jax.Array, T: jax.Array, Tv: jax.Array, dt: float,
+                   newton_iterations: int) -> jax.Array:
+    """Backward Euler with Newton iterations for one cell (c of shape (5,))."""
+    eye = jnp.eye(c_old.shape[-1], dtype=c_old.dtype)
+    rates = functools.partial(production_rates, T=T, Tv=Tv)
+    jac_fn = jax.jacfwd(rates)
+
+    def newton(_, c):
+        residual = c - c_old - dt * rates(c)
+        jacobian = eye - dt * jac_fn(c)
+        return c - jnp.linalg.solve(jacobian, residual)
+
+    return jax.lax.fori_loop(0, newton_iterations, newton, c_old)
+
+
+@functools.partial(jax.jit, static_argnames=('dt', 'newton_iterations'))
+def implicit_step(c: jax.Array, T: jax.Array, Tv: jax.Array, dt: float,
+                  newton_iterations: int = 4) -> jax.Array:
+    """Advances the concentrations by one backward-Euler step.
+
+    Args:
+      c: Molar concentrations [mol/m^3], shape (..., 5).
+      T: Translational-rotational temperature [K], shape (...).
+      Tv: Vibrational-electronic temperature [K], shape (...).
+      dt: Time step [s].
+      newton_iterations: Newton iterations per step.
+
+    Returns:
+      Concentrations after the step, same shape as `c`.
+    """
+    batch_shape = c.shape[:-1]
+    flat = functools.partial(_implicit_cell, dt=dt,
+                             newton_iterations=newton_iterations)
+    out = jax.vmap(flat)(c.reshape(-1, 5), T.reshape(-1), Tv.reshape(-1))
+    return out.reshape(batch_shape + (5,))
+
+
+def concentrations_from_mass_fractions(rho: jax.Array,
+                                       y: jax.Array) -> jax.Array:
+    """Molar concentrations [mol/m^3] from density and mass fractions."""
+    return rho[..., None] * y / jnp.asarray(MOLAR_MASS, y.dtype)
+
+
+def element_totals(c: jax.Array) -> jax.Array:
+    """Moles of (N, O) atoms per m^3, shape (..., 2)."""
+    return c @ jnp.asarray(ELEMENTS.T, c.dtype)
